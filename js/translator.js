@@ -29,8 +29,9 @@ export const PROVIDER_PRESETS = {
     id: 'nanogpt',
     name: 'Nano-GPT (nano-gpt.com)',
     baseUrl: 'https://nano-gpt.com/api/v1',
-    defaultModel: 'deepseek/deepseek-chat',
+    defaultModel: 'deepseek/deepseek-v4.1-flash',
     popularModels: [
+      { id: 'deepseek/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash (Сверхбыстрый)' },
       { id: 'deepseek/deepseek-chat', name: 'DeepSeek V3 (Рекомендуется)' },
       { id: 'deepseek/deepseek-r1', name: 'DeepSeek R1 (Рассуждающий)' },
       { id: 'gpt-4o-mini', name: 'GPT-4o Mini' },
