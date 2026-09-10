@@ -13,6 +13,14 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 # SSL context that avoids CRL check timeouts in corporate Windows environments
 SSL_CTX = ssl._create_unverified_context()
 
+import gzip
+
+# Headers to ignore when forwarding
+IGNORED_FORWARD_HEADERS = {
+    'host', 'origin', 'referer', 'content-length', 'connection',
+    'sec-fetch-mode', 'sec-fetch-site', 'sec-fetch-dest', 'accept-encoding'
+}
+
 class ProxyAndStaticServer(SimpleHTTPRequestHandler):
     def end_headers(self):
         # Enable CORS for all local requests
@@ -44,7 +52,7 @@ class ProxyAndStaticServer(SimpleHTTPRequestHandler):
 
         if not target_url:
             self.send_response(400)
-            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
             self.wfile.write(b'{"error": "Missing target parameter in query string"}')
             return
@@ -57,34 +65,45 @@ class ProxyAndStaticServer(SimpleHTTPRequestHandler):
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         }
         for k, v in self.headers.items():
-            k_lower = k.lower()
-            if k_lower in ('host', 'origin', 'referer', 'content-length', 'connection', 'sec-fetch-mode', 'sec-fetch-site', 'sec-fetch-dest'):
+            if k.lower() in IGNORED_FORWARD_HEADERS:
                 continue
             forward_headers[k] = v
 
         try:
             req = urllib.request.Request(target_url, data=body, headers=forward_headers, method=self.command)
-            # 25 seconds timeout to prevent long hanging
-            with urllib.request.urlopen(req, context=SSL_CTX, timeout=25) as resp:
+            with urllib.request.urlopen(req, context=SSL_CTX, timeout=35) as resp:
                 status = resp.status
                 resp_headers = resp.headers
                 resp_data = resp.read()
 
+                # Automatically decompress gzip if the upstream server compressed it
+                enc = resp_headers.get('Content-Encoding', '').lower()
+                if enc == 'gzip' or resp_data[:2] == b'\x1f\x8b':
+                    try:
+                        resp_data = gzip.decompress(resp_data)
+                    except Exception:
+                        pass
+
                 self.send_response(status)
-                content_type = resp_headers.get('Content-Type', 'application/json')
-                self.send_header('Content-Type', content_type)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
                 self.end_headers()
                 self.wfile.write(resp_data)
         except urllib.error.HTTPError as e:
             err_data = e.read()
+            enc = e.headers.get('Content-Encoding', '').lower()
+            if enc == 'gzip' or err_data[:2] == b'\x1f\x8b':
+                try:
+                    err_data = gzip.decompress(err_data)
+                except Exception:
+                    pass
+
             self.send_response(e.code)
-            content_type = e.headers.get('Content-Type', 'application/json')
-            self.send_header('Content-Type', content_type)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
             self.wfile.write(err_data)
         except Exception as e:
             self.send_response(502)
-            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
             err_msg = f'{{"error": {{"message": "Proxy connection error: {str(e)}"}} }}'
             self.wfile.write(err_msg.encode('utf-8'))

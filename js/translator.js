@@ -302,22 +302,27 @@ export async function translateText({
       });
     }
 
+    const resText = await response.text();
+    let resJson;
+    try {
+      resJson = JSON.parse(resText);
+    } catch (e) {
+      throw new Error(`Ошибка разбора ответа от нейросети (${response.status}): ${resText.slice(0, 150) || e.message}`);
+    }
+
     if (!response.ok) {
-      let errorDetail = '';
-      try {
-        const errorJson = await response.json();
-        errorDetail = errorJson.error?.message || JSON.stringify(errorJson);
-      } catch (e) {
-        errorDetail = await response.text();
-      }
+      const errorDetail = resJson.error?.message || JSON.stringify(resJson);
       throw new Error(`Ошибка API (${response.status}): ${errorDetail}`);
     }
 
-    const resJson = await response.json();
-    let translated = resJson.choices?.[0]?.message?.content || '';
+    const choice = resJson.choices?.[0];
+    const msg = choice?.message;
+    let translated = msg?.content || msg?.reasoning_content || choice?.text || '';
 
     // Strip accidental code block markers if model wrapped entire text
-    translated = cleanModelPreamble(translated);
+    if (typeof translated === 'string') {
+      translated = cleanModelPreamble(translated);
+    }
 
     return translated;
   } catch (err) {

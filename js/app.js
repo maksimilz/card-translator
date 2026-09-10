@@ -130,14 +130,17 @@ function showToast(message, type = 'info', duration = 4000) {
   const toast = document.createElement('div');
   toast.className = `toast toast-${type}`;
   const icons = { success: '✅', error: '❌', info: 'ℹ️', warning: '⚠️' };
-  toast.innerHTML = `<span>${icons[type] || 'ℹ️'}</span><div>${message}</div>`;
+  toast.innerHTML = `<span>${icons[type] || 'ℹ️'}</span><div style="flex:1;">${message}</div><button style="background:none;border:none;color:var(--text-muted);cursor:pointer;margin-left:8px;" onclick="this.parentElement.remove()">✕</button>`;
   elements.toastContainer.appendChild(toast);
+  const actualDuration = type === 'error' ? 12000 : duration;
   setTimeout(() => {
-    toast.style.opacity = '0';
-    toast.style.transform = 'translateY(-10px)';
-    toast.style.transition = 'all 0.3s ease';
-    setTimeout(() => toast.remove(), 300);
-  }, duration);
+    if (toast.parentElement) {
+      toast.style.opacity = '0';
+      toast.style.transform = 'translateY(-10px)';
+      toast.style.transition = 'all 0.3s ease';
+      setTimeout(() => toast.remove(), 300);
+    }
+  }, actualDuration);
 }
 
 /**
