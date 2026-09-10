@@ -1,7 +1,8 @@
 /**
  * Translator Module
- * Connects to OpenRouter, Ollama, LM Studio, and generic OpenAI-compatible endpoints.
+ * Connects to Nano-GPT, OpenRouter, Ollama, LM Studio, and generic OpenAI-compatible endpoints.
  * Tailored specifically for AI Character Cards (preserves {{char}}, {{user}}, <START>, markdown, slang).
+ * Includes auto-proxy routing to bypass CORS for Nano-GPT and third-party APIs.
  */
 
 export const DEFAULT_PROMPT_RU = `Ты — профессиональный литературный переводчик и эксперт по карточкам персонажей для текстовых ролевых игр (SillyTavern, Chub, TavernAI).
@@ -24,6 +25,23 @@ export const DEFAULT_PROMPT_RU = `Ты — профессиональный ли
    - НИКАКИХ предисловий, пояснений, кавычек вокруг всего ответа или фраз вроде "Вот перевод:".`;
 
 export const PROVIDER_PRESETS = {
+  nanogpt: {
+    id: 'nanogpt',
+    name: 'Nano-GPT (nano-gpt.com)',
+    baseUrl: 'https://nano-gpt.com/api/v1',
+    defaultModel: 'deepseek/deepseek-chat',
+    popularModels: [
+      { id: 'deepseek/deepseek-chat', name: 'DeepSeek V3 (Рекомендуется)' },
+      { id: 'deepseek/deepseek-r1', name: 'DeepSeek R1 (Рассуждающий)' },
+      { id: 'gpt-4o-mini', name: 'GPT-4o Mini' },
+      { id: 'chatgpt-4o-latest', name: 'GPT-4o' },
+      { id: 'claude-3-5-sonnet-20241022', name: 'Claude 3.5 Sonnet' },
+      { id: 'meta-llama/llama-3.3-70b-instruct', name: 'Llama 3.3 70B' },
+      { id: 'qwen/qwen-2.5-72b-instruct', name: 'Qwen 2.5 72B' }
+    ],
+    needsKey: true,
+    hint: 'API-ключ Nano-GPT (начинается на sk-...). Запросы автоматически идут через локальный прокси без блокировки CORS.'
+  },
   openrouter: {
     id: 'openrouter',
     name: 'OpenRouter',
@@ -70,19 +88,44 @@ export const PROVIDER_PRESETS = {
     defaultModel: '',
     popularModels: [],
     needsKey: false,
-    hint: 'Подходит для KoboldCpp, vLLM, TabbyAPI, llama.cpp server.'
+    hint: 'Подходит для Nano-GPT, KoboldCpp, vLLM, TabbyAPI, llama.cpp server.'
   }
 };
+
+/**
+ * Resolves whether a URL should go through local CORS proxy
+ */
+function resolveUrl(targetUrl, provider = '') {
+  const isLocalServer = window.location.protocol.startsWith('http') && 
+    (window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost');
+
+  if (!isLocalServer) return targetUrl;
+
+  const cleanTarget = targetUrl.trim();
+
+  // Nano-GPT and non-OpenRouter external endpoints need CORS proxy
+  if (
+    provider === 'nanogpt' ||
+    cleanTarget.includes('nano-gpt.com') ||
+    (!cleanTarget.includes('openrouter.ai') &&
+     !cleanTarget.includes('localhost') &&
+     !cleanTarget.includes('127.0.0.1'))
+  ) {
+    return `/api-proxy?target=${encodeURIComponent(cleanTarget)}`;
+  }
+
+  return cleanTarget;
+}
 
 /**
  * Loads saved translator settings from localStorage
  */
 export function loadSettings() {
   const defaults = {
-    provider: 'openrouter',
-    baseUrl: PROVIDER_PRESETS.openrouter.baseUrl,
+    provider: 'nanogpt',
+    baseUrl: PROVIDER_PRESETS.nanogpt.baseUrl,
     apiKey: '',
-    model: PROVIDER_PRESETS.openrouter.defaultModel,
+    model: PROVIDER_PRESETS.nanogpt.defaultModel,
     targetLang: 'ru',
     systemPrompt: DEFAULT_PROMPT_RU,
     temperature: 0.3,
@@ -115,13 +158,18 @@ export function saveSettings(settings) {
  * Fetches models list from the configured endpoint
  */
 export async function fetchAvailableModels(baseUrl, apiKey, provider) {
-  const url = `${baseUrl.replace(/\/+$/, '')}/models`;
+  const rawUrl = `${baseUrl.replace(/\/+$/, '')}/models`;
+  const fetchUrl = resolveUrl(rawUrl, provider);
+
   const headers = {
-    'Content-Type': 'application/json'
+    'Content-Type': 'application/json',
+    'Accept': 'application/json'
   };
 
   if (apiKey) {
-    headers['Authorization'] = `Bearer ${apiKey.trim()}`;
+    const trimmedKey = apiKey.trim();
+    headers['Authorization'] = `Bearer ${trimmedKey}`;
+    headers['x-api-key'] = trimmedKey;
   }
   if (provider === 'openrouter') {
     headers['HTTP-Referer'] = window.location.origin || 'http://localhost';
@@ -129,14 +177,20 @@ export async function fetchAvailableModels(baseUrl, apiKey, provider) {
   }
 
   try {
-    const response = await fetch(url, {
+    const response = await fetch(fetchUrl, {
       method: 'GET',
       headers
     });
 
     if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`Ошибка HTTP ${response.status}: ${errText.slice(0, 150)}`);
+      let errText = '';
+      try {
+        const errJson = await response.json();
+        errText = errJson.error?.message || JSON.stringify(errJson);
+      } catch {
+        errText = await response.text();
+      }
+      throw new Error(`Ошибка API (${response.status}): ${errText.slice(0, 150)}`);
     }
 
     const data = await response.json();
@@ -147,9 +201,22 @@ export async function fetchAvailableModels(baseUrl, apiKey, provider) {
     }
     return [];
   } catch (err) {
+    // If direct fetch failed with CORS / NetworkError, retry via proxy
+    if (!fetchUrl.startsWith('/api-proxy') && (err.message.includes('Failed to fetch') || err.message.includes('NetworkError'))) {
+      try {
+        const proxyUrl = `/api-proxy?target=${encodeURIComponent(rawUrl)}`;
+        const retryRes = await fetch(proxyUrl, { method: 'GET', headers });
+        if (retryRes.ok) {
+          const d = await retryRes.json();
+          if (Array.isArray(d.data)) return d.data.map(m => ({ id: m.id, name: m.name || m.id }));
+          if (Array.isArray(d)) return d.map(m => ({ id: m.id || m.name, name: m.name || m.id }));
+        }
+      } catch {}
+    }
+
     let msg = err.message;
     if (msg.includes('Failed to fetch') || msg.includes('NetworkError')) {
-      msg = 'Не удалось подключиться к эндпоинту. Проверьте адрес и убедитесь, что включен CORS (для Ollama: OLLAMA_ORIGINS="*", для LM Studio: Enable CORS).';
+      msg = 'Не удалось подключиться к эндпоинту. Проверьте запущен ли start.bat / run.py или включен ли CORS на сервере.';
     }
     throw new Error(msg);
   }
@@ -170,14 +237,18 @@ export async function translateText({
   }
 
   const cleanBaseUrl = settings.baseUrl.replace(/\/+$/, '');
-  const endpoint = `${cleanBaseUrl}/chat/completions`;
+  const rawEndpoint = `${cleanBaseUrl}/chat/completions`;
+  const endpoint = resolveUrl(rawEndpoint, settings.provider);
 
   const headers = {
-    'Content-Type': 'application/json'
+    'Content-Type': 'application/json',
+    'Accept': 'application/json'
   };
 
   if (settings.apiKey) {
-    headers['Authorization'] = `Bearer ${settings.apiKey.trim()}`;
+    const trimmedKey = settings.apiKey.trim();
+    headers['Authorization'] = `Bearer ${trimmedKey}`;
+    headers['x-api-key'] = trimmedKey;
   }
 
   if (settings.provider === 'openrouter') {
@@ -208,12 +279,23 @@ export async function translateText({
   };
 
   try {
-    const response = await fetch(endpoint, {
+    let response = await fetch(endpoint, {
       method: 'POST',
       headers,
       body: JSON.stringify(requestBody),
       signal
     });
+
+    // Auto-fallback to local proxy if direct fetch failed due to CORS
+    if (!response.ok && !endpoint.startsWith('/api-proxy') && response.status === 0) {
+      const proxyUrl = `/api-proxy?target=${encodeURIComponent(rawEndpoint)}`;
+      response = await fetch(proxyUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(requestBody),
+        signal
+      });
+    }
 
     if (!response.ok) {
       let errorDetail = '';
@@ -239,7 +321,7 @@ export async function translateText({
     }
     let msg = err.message;
     if (msg.includes('Failed to fetch') || msg.includes('NetworkError')) {
-      msg = 'Сетевая ошибка при запросе к LLM. Проверьте запущен ли локальный сервер и включен ли CORS.';
+      msg = 'Сетевая ошибка при запросе к LLM. Убедитесь, что сервер запущен через start.bat или run.py.';
     }
     throw new Error(msg);
   }
