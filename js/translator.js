@@ -3,10 +3,11 @@
  * Connects to Nano-GPT, OpenRouter, Ollama, LM Studio, and generic OpenAI-compatible endpoints.
  * Tailored specifically for AI Character Cards (preserves {{char}}, {{user}}, <START>, markdown, slang).
  * Includes auto-proxy routing to bypass CORS for Nano-GPT and third-party APIs.
+ * Supports both full-card context-aware translation in 1 request and single field translation.
  */
 
 export const DEFAULT_PROMPT_RU = `Ты — профессиональный литературный переводчик и эксперт по карточкам персонажей для текстовых ролевых игр (SillyTavern, Chub, TavernAI).
-Твоя задача — качественно, выразительно и стилистически точно перевести текст карточки персонажа на русский язык.
+Твоя задача — качественно, выразительно и стилистически точно перевести текст карточки персонажа на русский язык с сохранением контекста роли.
 
 КРИТИЧЕСКИ ВАЖНЫЕ ПРАВИЛА:
 1. СОХРАНЯЙ ВСЕ МАКРОСЫ И ПЕРЕМЕННЫЕ БЕЗ ИЗМЕНЕНИЙ:
@@ -18,7 +19,7 @@ export const DEFAULT_PROMPT_RU = `Ты — профессиональный ли
    - Разделители реплик <START> должны оставаться строго на своих строках.
    - Сохраняй абзацы, переносы строк, списки, квадратные скобки [Scenario: ...], W++ атрибуты если есть.
 3. ПЕРЕДАЧА СТИЛЯ И ХАРАКТЕРА:
-   - Передавай индивидуальный тон, акцент, сленг, грубость, манеру речи персонажа без цензурного смягчения.
+   - Учитывай пол персонажа, возраст, манеру речи и характер. Используй правильные окончания глаголов (мужской/женский род).
    - Живой литературный русский язык без англицизмов-калек, естественные диалоги.
 4. ФОРМАТ ОТВЕТА:
    - Выводи ТОЛЬКО готовый переведенный текст.
@@ -228,12 +229,159 @@ export async function fetchAvailableModels(baseUrl, apiKey, provider, signal = n
 }
 
 /**
- * Translates a given text using the selected LLM
+ * Translates ENTIRE character card as a single structured JSON block in ONE request.
+ * Guarantees that the LLM has complete context (name, appearance, gender, personality, scenario)
+ * and maintains consistent tone and pronoun agreement across all fields.
+ */
+export async function translateFullCard({
+  cardData,
+  settings,
+  signal = null
+}) {
+  if ((settings.provider === 'nanogpt' || settings.provider === 'openrouter') && (!settings.apiKey || !settings.apiKey.trim())) {
+    throw new Error('API-ключ не задан! Откройте «⚙️ Настройки API» и вставьте ваш ключ от ' + (settings.provider === 'nanogpt' ? 'Nano-GPT' : 'OpenRouter') + '.');
+  }
+
+  const cleanBaseUrl = settings.baseUrl.replace(/\/+$/, '');
+  const rawEndpoint = `${cleanBaseUrl}/chat/completions`;
+  const endpoint = resolveUrl(rawEndpoint, settings.provider);
+
+  const headers = {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json'
+  };
+
+  if (settings.apiKey) {
+    const trimmedKey = settings.apiKey.trim();
+    headers['Authorization'] = `Bearer ${trimmedKey}`;
+    headers['x-api-key'] = trimmedKey;
+  }
+
+  if (settings.provider === 'openrouter') {
+    headers['HTTP-Referer'] = window.location.origin || 'http://localhost';
+    headers['X-Title'] = 'AI Character Card Translator';
+  }
+
+  // Extract non-empty fields to translate
+  const payloadToTranslate = {};
+  const standardKeys = [
+    'name', 'first_mes', 'description', 'personality', 'scenario',
+    'mes_example', 'creator_notes', 'system_prompt', 'post_history_instructions'
+  ];
+  for (const k of standardKeys) {
+    if (cardData[k] && String(cardData[k]).trim()) {
+      payloadToTranslate[k] = cardData[k];
+    }
+  }
+  if (Array.isArray(cardData.alternate_greetings) && cardData.alternate_greetings.length > 0) {
+    payloadToTranslate.alternate_greetings = cardData.alternate_greetings;
+  }
+  if (Array.isArray(cardData.tags) && cardData.tags.length > 0) {
+    payloadToTranslate.tags = cardData.tags;
+  }
+
+  const fullCardSystemPrompt = `Ты — профессиональный литературный переводчик и эксперт по карточкам персонажей для SillyTavern / Chub.
+Твоя задача — перевести ВСЮ карточку персонажа целиком на русский язык, учитывая взаимосвязь всех полей в едином контексте.
+
+ГЛАВНЫЕ ПРАВИЛА:
+1. ЦЕЛОСТНОСТЬ КОНТЕКСТА: Используй описание персонажа, его пол, возраст, внешность и личность, чтобы правильно передать пол, тон, манеру речи и окончания глаголов (мужской/женский род) во всех репликах, первом сообщении и примерах диалогов!
+2. МАКРОСЫ: СТРОГО сохраняй без изменений все макросы: {{char}}, {{user}}, {{original}}, <START>, XML-теги. НЕ заменяй {{char}} на имя персонажа!
+3. ФОРМАТИРОВАНИЕ: Сохраняй действия в звездочках *действие*, прямую речь в кавычках, квадратные скобки [Scenario: ...], формат W++ или списки атрибутов.
+4. ФОРМАТ ОТВЕТА:
+   Верни ответ СТРОГО в виде валидного JSON-объекта, содержащего точно такие же ключи, со значениями, переведенными на русский язык.
+   Пример формата:
+   {
+     "name": "...",
+     "first_mes": "...",
+     "description": "...",
+     "personality": "...",
+     "scenario": "...",
+     "mes_example": "...",
+     "creator_notes": "...",
+     "system_prompt": "...",
+     "post_history_instructions": "...",
+     "alternate_greetings": ["..."],
+     "tags": ["..."]
+   }
+   НЕ пиши ничего до или после JSON. Ответ должен содержать ТОЛЬКО валидный JSON объект.`;
+
+  const userContent = `Переведи эту карточку персонажа на русский язык с сохранением контекста и формата JSON:\n\n` + JSON.stringify(payloadToTranslate, null, 2);
+
+  const requestBody = {
+    model: settings.model || 'deepseek/deepseek-chat',
+    messages: [
+      { role: 'system', content: fullCardSystemPrompt },
+      { role: 'user', content: userContent }
+    ],
+    temperature: parseFloat(settings.temperature) || 0.3,
+    max_tokens: parseInt(settings.maxTokens, 10) || 4096,
+    stream: false
+  };
+
+  try {
+    let response = await fetch(endpoint, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(requestBody),
+      signal
+    });
+
+    if (!response.ok && !endpoint.startsWith('/api-proxy') && response.status === 0) {
+      const proxyUrl = `/api-proxy?target=${encodeURIComponent(rawEndpoint)}`;
+      response = await fetch(proxyUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(requestBody),
+        signal
+      });
+    }
+
+    const resText = await response.text();
+    let resJson;
+    try {
+      resJson = JSON.parse(resText);
+    } catch (e) {
+      throw new Error(`Ошибка разбора ответа от нейросети (${response.status}): ${resText.slice(0, 150) || e.message}`);
+    }
+
+    if (!response.ok) {
+      const errorDetail = resJson.error?.message || JSON.stringify(resJson);
+      throw new Error(`Ошибка API (${response.status}): ${errorDetail}`);
+    }
+
+    const choice = resJson.choices?.[0];
+    const msg = choice?.message;
+    let content = msg?.content || msg?.reasoning_content || choice?.text || '';
+
+    // Extract JSON from model response
+    let jsonStr = cleanModelPreamble(content);
+    const matchJson = jsonStr.match(/\{[\s\S]*\}/);
+    if (matchJson) {
+      jsonStr = matchJson[0];
+    }
+
+    const parsedResult = JSON.parse(jsonStr);
+    return parsedResult;
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      throw new Error('Перевод был отменен пользователем.');
+    }
+    let msg = err.message;
+    if (msg.includes('Failed to fetch') || msg.includes('NetworkError')) {
+      msg = 'Сетевая ошибка при запросе к LLM. Убедитесь, что сервер запущен через start.bat или run.py.';
+    }
+    throw new Error(msg);
+  }
+}
+
+/**
+ * Translates a single field using the selected LLM, with optional character context.
  */
 export async function translateText({
   text,
   fieldLabel = '',
   charName = '',
+  context = null,
   settings,
   signal = null
 }) {
@@ -269,10 +417,16 @@ export async function translateText({
   if (charName) {
     userPromptParts.push(`Имя персонажа: ${charName}`);
   }
-  if (fieldLabel) {
-    userPromptParts.push(`Поле карточки: ${fieldLabel}`);
+  if (context?.personality) {
+    userPromptParts.push(`Контекст/Характер персонажа: ${context.personality.slice(0, 300)}`);
   }
-  userPromptParts.push(`Текст для перевода:\n\n${text}`);
+  if (context?.scenario) {
+    userPromptParts.push(`Сценарий/Обстановка: ${context.scenario.slice(0, 300)}`);
+  }
+  if (fieldLabel) {
+    userPromptParts.push(`Поле карточки для перевода: ${fieldLabel}`);
+  }
+  userPromptParts.push(`Исходный текст:\n\n${text}`);
 
   const userContent = userPromptParts.join('\n\n');
 

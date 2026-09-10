@@ -5,6 +5,8 @@ import socket
 import threading
 import webbrowser
 import ssl
+import json
+import gzip
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -12,8 +14,6 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
 # SSL context that avoids CRL check timeouts in corporate Windows environments
 SSL_CTX = ssl._create_unverified_context()
-
-import gzip
 
 # Headers to ignore when forwarding
 IGNORED_FORWARD_HEADERS = {
