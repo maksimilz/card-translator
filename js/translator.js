@@ -157,7 +157,7 @@ export function saveSettings(settings) {
 /**
  * Fetches models list from the configured endpoint
  */
-export async function fetchAvailableModels(baseUrl, apiKey, provider) {
+export async function fetchAvailableModels(baseUrl, apiKey, provider, signal = null) {
   const rawUrl = `${baseUrl.replace(/\/+$/, '')}/models`;
   const fetchUrl = resolveUrl(rawUrl, provider);
 
@@ -179,7 +179,8 @@ export async function fetchAvailableModels(baseUrl, apiKey, provider) {
   try {
     const response = await fetch(fetchUrl, {
       method: 'GET',
-      headers
+      headers,
+      signal
     });
 
     if (!response.ok) {
@@ -201,11 +202,14 @@ export async function fetchAvailableModels(baseUrl, apiKey, provider) {
     }
     return [];
   } catch (err) {
+    if (err.name === 'AbortError') {
+      throw new Error('Таймаут запроса моделей (10 сек). Выберите готовую модель из списка ниже.');
+    }
     // If direct fetch failed with CORS / NetworkError, retry via proxy
     if (!fetchUrl.startsWith('/api-proxy') && (err.message.includes('Failed to fetch') || err.message.includes('NetworkError'))) {
       try {
         const proxyUrl = `/api-proxy?target=${encodeURIComponent(rawUrl)}`;
-        const retryRes = await fetch(proxyUrl, { method: 'GET', headers });
+        const retryRes = await fetch(proxyUrl, { method: 'GET', headers, signal });
         if (retryRes.ok) {
           const d = await retryRes.json();
           if (Array.isArray(d.data)) return d.data.map(m => ({ id: m.id, name: m.name || m.id }));
@@ -216,7 +220,7 @@ export async function fetchAvailableModels(baseUrl, apiKey, provider) {
 
     let msg = err.message;
     if (msg.includes('Failed to fetch') || msg.includes('NetworkError')) {
-      msg = 'Не удалось подключиться к эндпоинту. Проверьте запущен ли start.bat / run.py или включен ли CORS на сервере.';
+      msg = 'Не удалось подключиться к эндпоинту. Проверьте запущен ли start.bat / run.py или выберите модель из списка вручную.';
     }
     throw new Error(msg);
   }

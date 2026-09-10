@@ -1111,8 +1111,13 @@ function initEvents() {
     elements.btnRefreshModels.disabled = true;
     elements.btnRefreshModels.innerHTML = '⏳ Загрузка...';
 
+    const abortCtrl = new AbortController();
+    const timerId = setTimeout(() => abortCtrl.abort(), 10000);
+
     try {
-      const models = await fetchAvailableModels(baseUrl, apiKey, provider);
+      const models = await fetchAvailableModels(baseUrl, apiKey, provider, abortCtrl.signal);
+      clearTimeout(timerId);
+
       if (models.length === 0) {
         showToast('Список моделей пуст или не поддерживается эндпоинтом', 'warning');
       } else {
@@ -1135,8 +1140,10 @@ function initEvents() {
         showToast(`Успешно загружено ${models.length} моделей!`, 'success');
       }
     } catch (err) {
-      showToast(err.message, 'error', 6000);
+      clearTimeout(timerId);
+      showToast(err.message, 'warning', 6000);
     } finally {
+      clearTimeout(timerId);
       elements.btnRefreshModels.disabled = false;
       elements.btnRefreshModels.innerHTML = '🔄 Обновить список моделей';
     }

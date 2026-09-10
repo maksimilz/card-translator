@@ -8,7 +8,7 @@ import ssl
 import urllib.request
 import urllib.error
 import urllib.parse
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
 # SSL context that avoids CRL check timeouts in corporate Windows environments
 SSL_CTX = ssl._create_unverified_context()
@@ -64,7 +64,8 @@ class ProxyAndStaticServer(SimpleHTTPRequestHandler):
 
         try:
             req = urllib.request.Request(target_url, data=body, headers=forward_headers, method=self.command)
-            with urllib.request.urlopen(req, context=SSL_CTX, timeout=90) as resp:
+            # 25 seconds timeout to prevent long hanging
+            with urllib.request.urlopen(req, context=SSL_CTX, timeout=25) as resp:
                 status = resp.status
                 resp_headers = resp.headers
                 resp_data = resp.read()
@@ -112,7 +113,7 @@ def main():
     print("=" * 60)
     print(" AI Character Card Translator & Editor")
     print(f" Сервер запущен: {url}")
-    print(" Встроенный CORS-прокси активен на /api-proxy")
+    print(" Встроенный многопоточный CORS-прокси активен на /api-proxy")
     print(" Открываем страницу в браузере...")
     print(" Для остановки закройте это окно или нажмите Ctrl+C")
     print("=" * 60)
@@ -123,7 +124,7 @@ def main():
 
     threading.Thread(target=open_browser, daemon=True).start()
 
-    server = HTTPServer(('127.0.0.1', port), ProxyAndStaticServer)
+    server = ThreadingHTTPServer(('127.0.0.1', port), ProxyAndStaticServer)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
