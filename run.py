@@ -69,6 +69,20 @@ class ProxyAndStaticServer(SimpleHTTPRequestHandler):
                 continue
             forward_headers[k] = v
 
+        # Check authentication headers and ensure both Authorization and x-api-key are passed
+        auth_val = forward_headers.get('Authorization') or forward_headers.get('authorization')
+        api_key_val = forward_headers.get('x-api-key') or forward_headers.get('X-Api-Key')
+
+        if auth_val and not api_key_val:
+            raw_key = auth_val.replace('Bearer ', '').replace('bearer ', '').strip()
+            forward_headers['x-api-key'] = raw_key
+        elif api_key_val and not auth_val:
+            forward_headers['Authorization'] = f"Bearer {api_key_val.strip()}"
+
+        has_key = bool(forward_headers.get('x-api-key') or forward_headers.get('Authorization'))
+        target_short = target_url.split('?')[0]
+        print(f"[Proxy] {self.command} {target_short} | Auth: {'✓ (Ключ передан)' if has_key else '✗ (КЛЮЧ ОТСУТСТВУЕТ!)'}")
+
         try:
             req = urllib.request.Request(target_url, data=body, headers=forward_headers, method=self.command)
             with urllib.request.urlopen(req, context=SSL_CTX, timeout=180) as resp:
@@ -84,6 +98,7 @@ class ProxyAndStaticServer(SimpleHTTPRequestHandler):
                     except Exception:
                         pass
 
+                print(f"[Proxy] -> Ответ от сервера: HTTP {status}")
                 self.send_response(status)
                 self.send_header('Content-Type', 'application/json; charset=utf-8')
                 self.end_headers()
@@ -96,6 +111,21 @@ class ProxyAndStaticServer(SimpleHTTPRequestHandler):
                     err_data = gzip.decompress(err_data)
                 except Exception:
                     pass
+
+            print(f"[Proxy] -> Сервер вернул HTTP {e.code}")
+
+            # Friendly message for 403 Forbidden with HTML Cloudflare/Vercel page
+            if e.code == 403 and (b'<!DOCTYPE' in err_data or b'<html' in err_data):
+                self.send_response(403)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                friendly_err = json.dumps({
+                    "error": {
+                        "message": "Nano-GPT отклонил запрос (403 Forbidden). Проверьте: 1) Введен ли API-ключ в окне «⚙️ Настройки API». 2) Есть ли средства на балансе nano-gpt.com."
+                    }
+                })
+                self.wfile.write(friendly_err.encode('utf-8'))
+                return
 
             self.send_response(e.code)
             self.send_header('Content-Type', 'application/json; charset=utf-8')

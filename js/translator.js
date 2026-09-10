@@ -241,6 +241,10 @@ export async function translateText({
     return '';
   }
 
+  if ((settings.provider === 'nanogpt' || settings.provider === 'openrouter') && (!settings.apiKey || !settings.apiKey.trim())) {
+    throw new Error('API-ключ не задан! Откройте «⚙️ Настройки API» и вставьте ваш ключ от ' + (settings.provider === 'nanogpt' ? 'Nano-GPT' : 'OpenRouter') + '.');
+  }
+
   const cleanBaseUrl = settings.baseUrl.replace(/\/+$/, '');
   const rawEndpoint = `${cleanBaseUrl}/chat/completions`;
   const endpoint = resolveUrl(rawEndpoint, settings.provider);
