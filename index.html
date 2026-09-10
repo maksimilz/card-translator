@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Character Card Translator & Editor | Client-side</title>
+  <link rel="stylesheet" href="css/app.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎭</text></svg>">
+</head>
+<body>
+
+  <!-- App Header -->
+  <header class="app-header">
+    <div class="brand-area">
+      <div class="brand-logo">🎭</div>
+      <div class="brand-title">
+        <h1>AI Card Translator <span class="badge-tag">100% Client-side</span></h1>
+        <p>Переводчик и редактор карточек SillyTavern / Chub (PNG & JSON)</p>
+      </div>
+    </div>
+
+    <div class="header-status">
+      <div class="status-pill" id="provider-pill" title="Текущий провайдер LLM">
+        <span class="status-dot"></span>
+        <span id="header-provider-name">OpenRouter</span>:
+        <strong id="header-model-name">deepseek/deepseek-chat</strong>
+      </div>
+      <div class="status-pill">
+        Язык: <strong>RU (Русский)</strong>
+      </div>
+      <button class="btn btn-secondary btn-sm" id="btn-open-settings" title="Настройки API и моделей">
+        ⚙️ Настройки API
+      </button>
+      <button class="btn btn-primary btn-sm" id="btn-load-file">
+        📁 Открыть карточку
+      </button>
+      <input type="file" id="file-input" accept=".png,.json" style="display: none;">
+      <input type="file" id="avatar-input" accept="image/png,image/jpeg,image/webp" style="display: none;">
+    </div>
+  </header>
+
+  <!-- Main Container -->
+  <main class="main-container">
+
+    <!-- Welcome / Empty Dropzone -->
+    <section id="welcome-view" class="welcome-dropzone">
+      <div class="dropzone-icon">📥</div>
+      <h2>Перетащите сюда карточку персонажа</h2>
+      <p>Поддерживаются форматы <strong>PNG</strong> со встроенными метаданными (SillyTavern, TavernAI V2/V3) и файлы <strong>JSON</strong>.</p>
+      <div style="display: flex; gap: 12px; margin-top: 10px;">
+        <button class="btn btn-primary" id="btn-browse-card">Выбрать файл карточки</button>
+        <button class="btn btn-secondary" id="btn-load-demo">Загрузить пример карточки</button>
+      </div>
+      <div style="margin-top: 24px; font-size: 0.8rem; color: var(--text-dim);">
+        🔒 100% безопасно: все файлы обрабатываются исключительно в вашем браузере
+      </div>
+    </section>
+
+    <!-- Workspace View (Card Loaded) -->
+    <section id="workspace-view" style="display: none; display: flex; flex-direction: column; gap: 16px;">
+      
+      <!-- Top Banner with Avatar, Character Info & Actions -->
+      <div class="card-banner">
+        <div class="char-info-box">
+          <div class="avatar-wrapper" id="avatar-container" title="Нажмите, чтобы заменить картинку персонажа">
+            <img id="char-avatar" class="avatar-img" src="" alt="Аватар персонажа">
+            <div class="avatar-overlay">Сменить фото</div>
+          </div>
+          <div class="char-title-meta">
+            <h2 id="banner-char-name">Имя персонажа</h2>
+            <div class="char-badges">
+              <span class="badge" id="card-spec-badge">V2 Spec</span>
+              <span class="badge badge-stat" id="stat-orig-tokens" title="Примерные токены оригинала">Оригинал: ~0 токенов</span>
+              <span class="badge badge-stat" id="stat-trans-tokens" title="Примерные токены перевода" style="border-color: rgba(99, 102, 241, 0.4); color: #a5b4fc;">Перевод: ~0 токенов</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="banner-actions">
+          <!-- Batch Translation Actions -->
+          <button class="btn btn-accent" id="btn-translate-all" title="Перевести все поля с помощью выбранной нейросети">
+            ⚡ Перевести всю карточку
+          </button>
+          <button class="btn btn-danger" id="btn-cancel-translation" style="display: none;">
+            ⏹️ Остановить
+          </button>
+          <button class="btn btn-secondary" id="btn-copy-all-orig" title="Скопировать все оригинальные поля в правую колонку">
+            📋 Скопировать оригинал
+          </button>
+
+          <!-- Export Options (Addressing user request for two copies) -->
+          <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+            <button class="btn btn-success" id="btn-download-trans-png" title="Скачать готовую карточку PNG с вшитыми переведенными метаданными">
+              💾 Скачать перевод (PNG)
+            </button>
+            <button class="btn btn-secondary btn-sm" id="btn-download-trans-json" title="Скачать только JSON переведенной карточки">
+              JSON
+            </button>
+            <button class="btn btn-secondary" id="btn-download-orig-png" title="Скачать оригинальную карточку PNG">
+              📥 Оригинал (PNG)
+            </button>
+            <button class="btn btn-secondary btn-sm" id="btn-download-orig-json" title="Скачать оригинальный JSON">
+              JSON
+            </button>
+          </div>
+        </div>
+
+        <!-- Batch Translation Progress Bar -->
+        <div class="batch-progress-bar-container" id="batch-progress-container">
+          <div class="batch-progress-bar" id="batch-progress-bar"></div>
+        </div>
+      </div>
+
+      <!-- Side-by-Side Comparison Workspace -->
+      <div class="editor-grid">
+        
+        <!-- Left: Original Source -->
+        <div class="column-panel">
+          <div class="column-header">
+            <h3>📖 Исходная карточка (Оригинал)</h3>
+            <span class="badge" id="orig-fields-count">Исходные данные</span>
+          </div>
+          <div class="column-body" id="orig-fields-container">
+            <!-- Dynamically populated original fields -->
+          </div>
+        </div>
+
+        <!-- Right: Translated & Editable Target -->
+        <div class="column-panel">
+          <div class="column-header">
+            <h3>✏️ Перевод и редактирование (RU)</h3>
+            <span class="badge" style="background: rgba(99, 102, 241, 0.2); color: #c7d2fe;">Готово для SillyTavern</span>
+          </div>
+          <div class="column-body" id="trans-fields-container">
+            <!-- Dynamically populated editable fields with translate buttons -->
+          </div>
+        </div>
+
+      </div>
+
+    </section>
+
+  </main>
+
+  <!-- Settings Modal -->
+  <div class="modal-backdrop" id="settings-modal">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3>⚙️ Настройки LLM для перевода</h3>
+        <button class="btn-icon" id="btn-close-settings" title="Закрыть">&times;</button>
+      </div>
+      <div class="modal-body">
+        
+        <!-- Provider Selection -->
+        <div class="form-group">
+          <label for="setting-provider">Провайдер нейросети:</label>
+          <select id="setting-provider" class="form-control">
+            <option value="openrouter">OpenRouter (Claude, DeepSeek, GPT-4o, Gemini, Qwen)</option>
+            <option value="ollama">Ollama (Локальный сервер localhost:11434)</option>
+            <option value="lmstudio">LM Studio (Локальный сервер localhost:1234)</option>
+            <option value="custom">Пользовательский OpenAI-совместимый эндпоинт</option>
+          </select>
+          <div class="form-hint" id="provider-hint">
+            Требуется API-ключ OpenRouter.
+          </div>
+        </div>
+
+        <!-- API Key (for OpenRouter / Custom) -->
+        <div class="form-group" id="group-api-key">
+          <label for="setting-api-key">API Ключ (OpenRouter / Auth Token):</label>
+          <div style="position: relative;">
+            <input type="password" id="setting-api-key" class="form-control" placeholder="sk-or-v1-...">
+            <button type="button" id="btn-toggle-key-visibility" class="btn-icon" style="position: absolute; right: 6px; top: 6px; background: transparent; border: none;">👁️</button>
+          </div>
+          <div class="form-hint">Ключ хранится строго локально в вашем браузере (localStorage) и никуда не передается.</div>
+        </div>
+
+        <!-- Base URL -->
+        <div class="form-group">
+          <label for="setting-base-url">Базовый URL эндпоинта:</label>
+          <input type="text" id="setting-base-url" class="form-control" value="https://openrouter.ai/api/v1">
+        </div>
+
+        <!-- Model Selection with Refresh Button -->
+        <div class="form-group">
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <label for="setting-model">Модель:</label>
+            <button type="button" class="btn btn-secondary btn-sm" id="btn-refresh-models" title="Запросить список моделей через /v1/models">
+              🔄 Обновить список моделей
+            </button>
+          </div>
+          <div style="display: flex; gap: 8px;">
+            <select id="setting-model-select" class="form-control" style="flex: 1;">
+              <!-- Options populated dynamically -->
+            </select>
+            <input type="text" id="setting-model-custom" class="form-control" placeholder="или введите вручную" style="flex: 1;">
+          </div>
+          <div class="form-hint">Выберите из популярных пресетов или загрузите список прямо из эндпоинта.</div>
+        </div>
+
+        <!-- CORS Instructions for Local LLMs -->
+        <div id="local-cors-help" style="display: none; background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.3); border-radius: var(--radius-sm); padding: 12px; font-size: 0.8rem;">
+          <strong>💡 Настройка CORS для локальных моделей:</strong>
+          <p style="margin-top: 4px;" id="cors-help-text">
+            Для Ollama в командной строке перед запуском выполните:<br>
+            <code class="code-pill">set OLLAMA_ORIGINS=* &amp;&amp; ollama serve</code>
+          </p>
+        </div>
+
+        <!-- System Prompt -->
+        <div class="form-group">
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <label for="setting-system-prompt">Системный промпт переводчика:</label>
+            <button type="button" class="btn btn-secondary btn-sm" id="btn-reset-prompt" style="font-size: 0.75rem;">
+              Сбросить на стандартный
+            </button>
+          </div>
+          <textarea id="setting-system-prompt" class="form-control" rows="6" style="font-size: 0.8rem; line-height: 1.4;"></textarea>
+          <div class="form-hint">Инструкция гарантирует сохранение {{char}}, {{user}}, <START>, звездочек действий и живой русский язык.</div>
+        </div>
+
+        <!-- Temperature -->
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 14px;">
+          <div class="form-group">
+            <label for="setting-temperature">Температура (Креативность):</label>
+            <input type="number" id="setting-temperature" class="form-control" min="0" max="1" step="0.05" value="0.3">
+          </div>
+          <div class="form-group">
+            <label for="setting-max-tokens">Max Tokens на ответ:</label>
+            <input type="number" id="setting-max-tokens" class="form-control" value="4096">
+          </div>
+        </div>
+
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="btn-cancel-settings">Отмена</button>
+        <button class="btn btn-primary" id="btn-save-settings">Сохранить настройки</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Drag and Drop Global Overlay -->
+  <div id="drag-overlay">
+    <div style="font-size: 64px; margin-bottom: 16px;">📥</div>
+    <h2 style="font-size: 1.8rem; font-weight: 700;">Отпустите файл здесь</h2>
+    <p style="color: var(--text-muted);">PNG карточка или JSON файл</p>
+  </div>
+
+  <!-- Toast Notification Container -->
+  <div id="toast-container"></div>
+
+  <!-- Scripts -->
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
