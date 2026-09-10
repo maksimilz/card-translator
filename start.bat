@@ -1,21 +1,8 @@
 @echo off
-chcp 65001 >nul
-title AI Character Card Translator & Editor
-
-echo ================================================================
-echo    AI Character Card Translator ^& Editor (100%% Client-Side)
-echo ================================================================
-echo.
-echo Запуск локального веб-сервера...
-
-where python >nul 2>&1
-if %ERRORLEVEL% EQU 0 (
-    echo Найден Python 3! Запускаем локальный сервер на порту 8000...
-    start "" http://localhost:8000
-    python -m http.server 8000
-) else (
-    echo Python не найден в PATH. Открываем index.html напрямую в браузере...
+cd /d "%~dp0"
+python run.py
+if errorlevel 1 (
+    echo [!] Python returned an error, opening index.html directly...
     start "" "index.html"
+    pause
 )
-
-pause
