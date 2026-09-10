@@ -355,16 +355,75 @@ body {
   align-items: center;
 }
 
-/* Progress bar for batch translation */
+/* Progress bar & step indicator for batch translation */
 .batch-progress-bar-container {
   width: 100%;
-  background: var(--bg-input);
+  background: var(--bg-card-alt);
   border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: 12px 16px;
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.batch-progress-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.batch-progress-steps {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.step-pill {
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 3px 10px;
   border-radius: 999px;
+  background: var(--bg-input);
+  color: var(--text-dim);
+  border: 1px solid var(--border-color);
+  transition: all 0.2s ease;
+}
+
+.step-pill.active {
+  background: rgba(99, 102, 241, 0.2);
+  color: #a5b4fc;
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 10px rgba(99, 102, 241, 0.3);
+}
+
+.step-pill.completed {
+  background: rgba(16, 185, 129, 0.2);
+  color: #6ee7b7;
+  border-color: var(--accent-success);
+}
+
+.step-separator {
+  color: var(--text-dim);
+  font-size: 0.8rem;
+}
+
+.batch-progress-text {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.batch-progress-track {
+  width: 100%;
   height: 8px;
+  background: var(--bg-input);
+  border-radius: 999px;
   overflow: hidden;
-  margin-top: 10px;
-  display: none;
+  border: 1px solid var(--border-color);
 }
 
 .batch-progress-bar {
@@ -372,6 +431,101 @@ body {
   background: linear-gradient(90deg, var(--accent-primary), var(--accent-secondary));
   width: 0%;
   transition: width 0.3s ease;
+}
+
+/* Passport Context Summary Box (Step 1) */
+.passport-container {
+  background: var(--bg-card);
+  border: 1px solid rgba(99, 102, 241, 0.3);
+  border-radius: var(--radius-lg);
+  padding: 14px 18px;
+  box-shadow: var(--shadow-main);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  animation: fadeIn 0.25s ease;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.passport-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.passport-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.95rem;
+}
+
+.passport-content {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  transition: max-height 0.25s ease;
+}
+
+.passport-meta-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.passport-chip {
+  background: var(--bg-card-alt);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  padding: 6px 12px;
+  font-size: 0.8rem;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.passport-chip-label {
+  color: var(--text-dim);
+}
+
+.passport-chip strong {
+  color: #c7d2fe;
+}
+
+.passport-glossary-box {
+  background: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.passport-glossary-title {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.passport-glossary-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.glossary-chip {
+  background: rgba(99, 102, 241, 0.15);
+  border: 1px solid rgba(99, 102, 241, 0.3);
+  color: #e0e7ff;
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 0.775rem;
+  font-family: ui-monospace, monospace;
 }
 
 /* Workspace / Comparison Columns */

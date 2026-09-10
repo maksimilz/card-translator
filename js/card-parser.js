@@ -66,6 +66,11 @@ export function normalizeCard(json) {
     extensions: (data.extensions && typeof data.extensions === 'object') ? data.extensions : {}
   };
 
+  const charBook = data.character_book || json.character_book || (data.extensions && data.extensions.character_book);
+  if (charBook && typeof charBook === 'object') {
+    normalizedData.character_book = JSON.parse(JSON.stringify(charBook));
+  }
+
   return {
     spec,
     spec_version,
@@ -87,25 +92,31 @@ export function serializeV2Card(card) {
   const c = normalizeCard(card);
   const data = c.data;
 
+  const resultData = {
+    name: data.name,
+    description: data.description,
+    personality: data.personality,
+    scenario: data.scenario,
+    first_mes: data.first_mes,
+    mes_example: data.mes_example,
+    creator_notes: data.creator_notes,
+    system_prompt: data.system_prompt,
+    post_history_instructions: data.post_history_instructions,
+    alternate_greetings: data.alternate_greetings || [],
+    tags: data.tags || [],
+    creator: data.creator || '',
+    character_version: data.character_version || '1.0',
+    extensions: data.extensions || {}
+  };
+
+  if (data.character_book && typeof data.character_book === 'object') {
+    resultData.character_book = data.character_book;
+  }
+
   return {
     spec: 'chara_card_v2',
     spec_version: '2.0',
-    data: {
-      name: data.name,
-      description: data.description,
-      personality: data.personality,
-      scenario: data.scenario,
-      first_mes: data.first_mes,
-      mes_example: data.mes_example,
-      creator_notes: data.creator_notes,
-      system_prompt: data.system_prompt,
-      post_history_instructions: data.post_history_instructions,
-      alternate_greetings: data.alternate_greetings || [],
-      tags: data.tags || [],
-      creator: data.creator || '',
-      character_version: data.character_version || '1.0',
-      extensions: data.extensions || {}
-    }
+    data: resultData
   };
 }
 
@@ -134,17 +145,35 @@ export function countStats(text) {
 export function calculateCardStats(card) {
   if (!card || !card.data) return { chars: 0, words: 0, estimatedTokens: 0 };
   const d = card.data;
-  let fullText = [
+  const parts = [
     d.name,
     d.description,
     d.personality,
     d.scenario,
     d.first_mes,
     d.mes_example,
+    d.creator_notes,
     d.system_prompt,
     d.post_history_instructions,
     ...(d.alternate_greetings || [])
-  ].filter(Boolean).join('\n\n');
+  ];
 
+  if (d.character_book && typeof d.character_book === 'object') {
+    if (d.character_book.name) parts.push(d.character_book.name);
+    if (d.character_book.description) parts.push(d.character_book.description);
+    if (Array.isArray(d.character_book.entries)) {
+      for (const entry of d.character_book.entries) {
+        if (!entry) continue;
+        if (entry.comment) parts.push(entry.comment);
+        if (entry.content) parts.push(entry.content);
+        if (Array.isArray(entry.keys)) parts.push(entry.keys.join(' '));
+        else if (typeof entry.keys === 'string') parts.push(entry.keys);
+        if (Array.isArray(entry.secondary_keys)) parts.push(entry.secondary_keys.join(' '));
+        else if (typeof entry.secondary_keys === 'string') parts.push(entry.secondary_keys);
+      }
+    }
+  }
+
+  const fullText = parts.filter(Boolean).join('\n\n');
   return countStats(fullText);
 }

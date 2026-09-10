@@ -57,7 +57,7 @@
     </section>
 
     <!-- Workspace View (Card Loaded) -->
-    <section id="workspace-view" style="display: none; display: flex; flex-direction: column; gap: 16px;">
+    <section id="workspace-view" style="display: none; flex-direction: column; gap: 16px;">
       
       <!-- Top Banner with Avatar, Character Info & Actions -->
       <div class="card-banner">
@@ -78,7 +78,7 @@
 
         <div class="banner-actions">
           <!-- Batch Translation Actions -->
-          <button class="btn btn-accent" id="btn-translate-all" title="Перевести все поля с помощью выбранной нейросети">
+          <button class="btn btn-accent" id="btn-translate-all" title="Перевести всю карточку в 2 шага (анализ контекста + XML-перевод)">
             ⚡ Перевести всю карточку
           </button>
           <button class="btn btn-danger" id="btn-cancel-translation" style="display: none;">
@@ -105,9 +105,65 @@
           </div>
         </div>
 
-        <!-- Batch Translation Progress Bar -->
-        <div class="batch-progress-bar-container" id="batch-progress-container">
-          <div class="batch-progress-bar" id="batch-progress-bar"></div>
+        <!-- Batch Translation Progress Bar & Steps Indicator -->
+        <div class="batch-progress-bar-container" id="batch-progress-container" style="display: none;">
+          <div class="batch-progress-header">
+            <div class="batch-progress-steps">
+              <span class="step-pill" id="step-pill-1">Шаг 1: Контекст и глоссарий</span>
+              <span class="step-separator">→</span>
+              <span class="step-pill" id="step-pill-2">Шаг 2: Полный перевод карточки</span>
+            </div>
+            <span class="batch-progress-text" id="batch-progress-text">Подготовка к переводу...</span>
+          </div>
+          <div class="batch-progress-track">
+            <div class="batch-progress-bar" id="batch-progress-bar"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Passport / Context Summary Box (Step 1) -->
+      <div id="passport-container" class="passport-container" style="display: none;">
+        <div class="passport-header">
+          <div class="passport-title">
+            <span style="font-size: 1.1rem;">📋</span>
+            <strong>Паспорт контекста персонажа (Шаг 1)</strong>
+            <span class="badge" id="passport-badge">Анализ завершен</span>
+          </div>
+          <button class="btn btn-secondary btn-sm" id="btn-toggle-passport" type="button">
+            Свернуть / Развернуть
+          </button>
+        </div>
+        <div class="passport-content" id="passport-content">
+          <div class="passport-meta-grid">
+            <div class="passport-chip">
+              <span class="passport-chip-label">Имя (RU):</span>
+              <strong id="passport-name">—</strong>
+            </div>
+            <div class="passport-chip">
+              <span class="passport-chip-label">Пол:</span>
+              <strong id="passport-gender">—</strong>
+            </div>
+            <div class="passport-chip">
+              <span class="passport-chip-label">Род глаголов:</span>
+              <strong id="passport-verb-gender">—</strong>
+            </div>
+            <div class="passport-chip">
+              <span class="passport-chip-label">Обращение:</span>
+              <strong id="passport-pronoun">—</strong>
+            </div>
+            <div class="passport-chip">
+              <span class="passport-chip-label">Тон речи:</span>
+              <strong id="passport-tone">—</strong>
+            </div>
+          </div>
+          <div class="passport-glossary-box" id="passport-glossary-box" style="display: none;">
+            <div class="passport-glossary-title">Глоссарий терминов и имен:</div>
+            <div class="passport-glossary-list" id="passport-glossary-list"></div>
+          </div>
+          <div class="passport-glossary-box" id="passport-lorebook-box" style="display: none;">
+            <div class="passport-glossary-title">Ключи активации лорбука (Trigger Keys):</div>
+            <div class="passport-glossary-list" id="passport-lorebook-list"></div>
+          </div>
         </div>
       </div>
 

@@ -25,6 +25,7 @@ import {
   saveSettings,
   translateText,
   translateFullCard,
+  analyzeCardContext,
   fetchAvailableModels,
   PROVIDER_PRESETS,
   DEFAULT_PROMPT_RU
@@ -40,7 +41,8 @@ const state = {
   originalFileName: 'character',
   settings: loadSettings(),
   abortController: null,
-  isTranslating: false
+  isTranslating: false,
+  passport: null
 };
 
 // Built-in Demo Card for quick testing
@@ -95,6 +97,23 @@ const elements = {
   btnDownloadOrigJson: document.getElementById('btn-download-orig-json'),
   batchProgressContainer: document.getElementById('batch-progress-container'),
   batchProgressBar: document.getElementById('batch-progress-bar'),
+  stepPill1: document.getElementById('step-pill-1'),
+  stepPill2: document.getElementById('step-pill-2'),
+  batchProgressText: document.getElementById('batch-progress-text'),
+  // Passport / Context Box
+  passportContainer: document.getElementById('passport-container'),
+  passportBadge: document.getElementById('passport-badge'),
+  btnTogglePassport: document.getElementById('btn-toggle-passport'),
+  passportContent: document.getElementById('passport-content'),
+  passportName: document.getElementById('passport-name'),
+  passportGender: document.getElementById('passport-gender'),
+  passportVerbGender: document.getElementById('passport-verb-gender'),
+  passportPronoun: document.getElementById('passport-pronoun'),
+  passportTone: document.getElementById('passport-tone'),
+  passportGlossaryBox: document.getElementById('passport-glossary-box'),
+  passportGlossaryList: document.getElementById('passport-glossary-list'),
+  passportLorebookBox: document.getElementById('passport-lorebook-box'),
+  passportLorebookList: document.getElementById('passport-lorebook-list'),
   // Header status
   headerProviderName: document.getElementById('header-provider-name'),
   headerModelName: document.getElementById('header-model-name'),
@@ -188,14 +207,68 @@ function createPlaceholderAvatar(name = 'AI') {
 }
 
 /**
+ * Renders Passport summary box (Step 1 output)
+ */
+function renderPassport(passport) {
+  if (!passport) {
+    elements.passportContainer.style.display = 'none';
+    return;
+  }
+
+  elements.passportContainer.style.display = 'flex';
+  elements.passportName.textContent = passport.character_name_ru || '—';
+  elements.passportGender.textContent = passport.gender || '—';
+  elements.passportVerbGender.textContent = passport.verb_gender || '—';
+  elements.passportPronoun.textContent = passport.user_pronoun || '—';
+  elements.passportTone.textContent = passport.speech_tone || '—';
+
+  const glossaryEntries = Object.entries(passport.glossary || {});
+  if (glossaryEntries.length > 0) {
+    elements.passportGlossaryBox.style.display = 'flex';
+    elements.passportGlossaryList.innerHTML = '';
+    glossaryEntries.forEach(([en, ru]) => {
+      const chip = document.createElement('span');
+      chip.className = 'glossary-chip';
+      chip.textContent = `${en} → ${ru}`;
+      elements.passportGlossaryList.appendChild(chip);
+    });
+  } else {
+    elements.passportGlossaryBox.style.display = 'none';
+  }
+
+  const lorebookEntries = Object.entries(passport.lorebook_keys || {});
+  if (elements.passportLorebookBox && lorebookEntries.length > 0) {
+    elements.passportLorebookBox.style.display = 'flex';
+    elements.passportLorebookList.innerHTML = '';
+    lorebookEntries.forEach(([en, ru]) => {
+      const chip = document.createElement('span');
+      chip.className = 'glossary-chip';
+      chip.style.borderColor = 'rgba(16, 185, 129, 0.4)';
+      chip.style.background = 'rgba(16, 185, 129, 0.1)';
+      chip.textContent = `${en} → ${ru}`;
+      elements.passportLorebookList.appendChild(chip);
+    });
+  } else if (elements.passportLorebookBox) {
+    elements.passportLorebookBox.style.display = 'none';
+  }
+}
+
+/**
  * Loads and initializes a character card in the application
  */
 async function loadCardIntoApp(cardJson, imageBytes = null, fileName = 'character') {
   try {
+    // Revoke previous avatar ObjectURL to prevent memory leaks
+    if (state.avatarUrl) {
+      URL.revokeObjectURL(state.avatarUrl);
+      state.avatarUrl = null;
+    }
+
     const normalized = normalizeCard(cardJson);
     state.originalCard = cloneCard(normalized);
     state.translatedCard = cloneCard(normalized);
     state.originalFileName = fileName.replace(/\.[^/.]+$/, '');
+    state.passport = null;
 
     if (imageBytes && isPNG(imageBytes)) {
       state.originalImageBytes = imageBytes;
@@ -218,6 +291,7 @@ async function loadCardIntoApp(cardJson, imageBytes = null, fileName = 'characte
     elements.bannerCharName.textContent = state.originalCard.data.name || 'Безымянный персонаж';
     elements.cardSpecBadge.textContent = `${state.originalCard.spec} (v${state.originalCard.spec_version})`;
 
+    renderPassport(null);
     renderFields();
     updateCardStats();
     showToast(`Карточка «${state.originalCard.data.name || 'Персонаж'}» успешно загружена!`, 'success');
@@ -326,6 +400,100 @@ function renderFields() {
 
   // Render Tags
   renderTagsField(origData.tags || [], transData.tags || []);
+
+  // Render Lorebook / Character Book
+  if (origData.character_book) {
+    renderLorebook(origData.character_book, transData.character_book);
+  }
+}
+
+/**
+ * Renders Character Book (Lorebook) entries if present
+ */
+function renderLorebook(origBook, transBook) {
+  if (!origBook || !Array.isArray(origBook.entries) || origBook.entries.length === 0) return;
+
+  // Left: Original lorebook
+  const origBox = document.createElement('div');
+  origBox.className = 'field-box';
+  let origEntriesHtml = '';
+  origBook.entries.forEach((entry, idx) => {
+    if (!entry) return;
+    const keysStr = Array.isArray(entry.keys) ? entry.keys.join(', ') : (entry.keys || '');
+    origEntriesHtml += `
+      <div class="greeting-item" style="margin-bottom: 12px;">
+        <div style="font-size: 0.75rem; color: var(--text-dim); font-weight: 600; display:flex; justify-content:space-between; margin-bottom: 4px;">
+          <span>Запись #${idx + 1}: ${escapeHtml(entry.comment || 'Без названия')}</span>
+          <span style="color: #a5b4fc;">Ключи: ${escapeHtml(keysStr)}</span>
+        </div>
+        <div class="field-readonly" style="max-height: 140px; overflow-y: auto;">${escapeHtml(entry.content || '')}</div>
+      </div>
+    `;
+  });
+
+  origBox.innerHTML = `
+    <div class="field-header">
+      <span class="field-label">Лорбук / База знаний (${escapeHtml(origBook.name || 'Lorebook')}, записей: ${origBook.entries.length})</span>
+      <button class="btn btn-secondary btn-sm" data-action="copy-orig" data-key="lorebook_all" title="Скопировать весь лорбук">📋 Копировать</button>
+    </div>
+    <div class="greetings-list">${origEntriesHtml}</div>
+  `;
+  elements.origFieldsContainer.appendChild(origBox);
+
+  // Right: Translated lorebook
+  const transBox = document.createElement('div');
+  transBox.className = 'field-box';
+  let transEntriesHtml = '';
+  const transEntries = (transBook && Array.isArray(transBook.entries)) ? transBook.entries : [];
+  
+  transEntries.forEach((entry, idx) => {
+    if (!entry) return;
+    const keysStr = Array.isArray(entry.keys) ? entry.keys.join(', ') : (entry.keys || '');
+    transEntriesHtml += `
+      <div class="greeting-item" style="margin-bottom: 12px;" data-lore-idx="${idx}">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 6px;">
+          <span style="font-size: 0.8rem; font-weight: 600; color: #a5b4fc;">Запись #${idx + 1}: ${escapeHtml(entry.comment || '')}</span>
+          <button class="btn btn-secondary btn-sm" data-action="copy-orig-lore-entry" data-idx="${idx}" type="button">Копировать из оригинала</button>
+        </div>
+        <div style="margin-bottom: 6px;">
+          <label style="font-size: 0.75rem; color: var(--text-dim); display:block; margin-bottom: 2px;">Ключи активации (через запятую):</label>
+          <input type="text" class="field-input" data-lore-keys-idx="${idx}" value="${escapeHtml(keysStr)}">
+        </div>
+        <div>
+          <label style="font-size: 0.75rem; color: var(--text-dim); display:block; margin-bottom: 2px;">Содержание записи:</label>
+          <textarea class="field-textarea" data-lore-content-idx="${idx}" rows="4">${escapeHtml(entry.content || '')}</textarea>
+        </div>
+      </div>
+    `;
+  });
+
+  transBox.innerHTML = `
+    <div class="field-header">
+      <span class="field-label">Лорбук / База знаний (${escapeHtml((transBook && transBook.name) || origBook.name || 'Lorebook')})</span>
+    </div>
+    <div class="greetings-list" id="trans-lorebook-list">${transEntriesHtml}</div>
+  `;
+  elements.transFieldsContainer.appendChild(transBox);
+
+  // Event listeners for translated lorebook inputs
+  transBox.querySelectorAll('[data-lore-keys-idx]').forEach(input => {
+    input.addEventListener('input', (e) => {
+      const idx = parseInt(e.target.getAttribute('data-lore-keys-idx'), 10);
+      if (state.translatedCard?.data?.character_book?.entries?.[idx]) {
+        state.translatedCard.data.character_book.entries[idx].keys = e.target.value.split(/[\n,;]+/).map(k => k.trim()).filter(Boolean);
+      }
+    });
+  });
+
+  transBox.querySelectorAll('[data-lore-content-idx]').forEach(textarea => {
+    textarea.addEventListener('input', (e) => {
+      const idx = parseInt(e.target.getAttribute('data-lore-content-idx'), 10);
+      if (state.translatedCard?.data?.character_book?.entries?.[idx]) {
+        state.translatedCard.data.character_book.entries[idx].content = e.target.value;
+        updateCardStats();
+      }
+    });
+  });
 }
 
 /**
@@ -473,8 +641,8 @@ function escapeHtml(str) {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
+    .replace(/\x22/g, '&quot;')
+    .replace(/\x27/g, '&#039;');
 }
 
 /**
@@ -513,6 +681,7 @@ async function handleTranslateField(fieldKey) {
         personality: state.originalCard.data.personality,
         scenario: state.originalCard.data.scenario
       },
+      passport: state.passport,
       settings: state.settings,
       signal: state.abortController.signal
     });
@@ -548,6 +717,11 @@ async function handleTranslateField(fieldKey) {
  * Translates single alternate greeting
  */
 async function handleTranslateAltGreeting(idx) {
+  if (state.isTranslating) {
+    showToast('Перевод уже выполняется, подождите или отмените его.', 'warning');
+    return;
+  }
+
   const origText = (state.originalCard.data.alternate_greetings || [])[idx];
   if (!origText || !origText.trim()) {
     showToast('Исходное приветствие пустое', 'warning');
@@ -568,6 +742,11 @@ async function handleTranslateAltGreeting(idx) {
       text: origText,
       fieldLabel: `Альтернативное приветствие #${idx + 1}`,
       charName: state.translatedCard.data.name || state.originalCard.data.name,
+      context: {
+        personality: state.originalCard.data.personality,
+        scenario: state.originalCard.data.scenario
+      },
+      passport: state.passport,
       settings: state.settings,
       signal: state.abortController.signal
     });
@@ -593,6 +772,11 @@ async function handleTranslateAltGreeting(idx) {
  * Translates Tags
  */
 async function handleTranslateTags() {
+  if (state.isTranslating) {
+    showToast('Перевод уже выполняется, подождите или отмените его.', 'warning');
+    return;
+  }
+
   const origTags = state.originalCard.data.tags || [];
   const origText = Array.isArray(origTags) ? origTags.join(', ') : String(origTags);
   if (!origText.trim()) {
@@ -606,15 +790,20 @@ async function handleTranslateTags() {
     btn.innerHTML = '⏳...';
   }
 
+  state.abortController = new AbortController();
+  state.isTranslating = true;
+
   try {
     const translated = await translateText({
       text: origText,
       fieldLabel: 'Список тегов через запятую',
       charName: state.translatedCard.data.name || state.originalCard.data.name,
-      settings: state.settings
+      passport: state.passport,
+      settings: state.settings,
+      signal: state.abortController.signal
     });
 
-    const parsedTags = translated.split(',').map(t => t.trim()).filter(Boolean);
+    const parsedTags = translated.split(/[\n,;]+/).map(t => t.trim()).filter(Boolean);
     state.translatedCard.data.tags = parsedTags;
     const input = document.getElementById('trans-tags-input');
     if (input) input.value = parsedTags.join(', ');
@@ -622,6 +811,8 @@ async function handleTranslateTags() {
   } catch (err) {
     showToast(err.message, 'error');
   } finally {
+    state.isTranslating = false;
+    state.abortController = null;
     if (btn) {
       btn.disabled = false;
       btn.innerHTML = '🌐 Перевести';
@@ -630,7 +821,9 @@ async function handleTranslateTags() {
 }
 
 /**
- * Batch translation of all card fields
+ * 2-Step Batch Translation of all card fields & lorebook
+ * Step 1: Context & Glossary Pass
+ * Step 2: Full Card XML Translation with Passport Injection
  */
 async function handleTranslateAll() {
   if (state.isTranslating) return;
@@ -641,19 +834,45 @@ async function handleTranslateAll() {
 
   elements.btnTranslateAll.style.display = 'none';
   elements.btnCancelTranslation.style.display = 'inline-flex';
-  elements.batchProgressContainer.style.display = 'block';
-  elements.batchProgressBar.style.width = '35%';
+  elements.btnCopyAllOrig.disabled = true;
 
-  showToast('Переводим всю карточку целиком в едином контексте (1 запрос к нейросети)...', 'info', 6000);
+  // Initialize 2-step progress UI
+  elements.batchProgressContainer.style.display = 'flex';
+  elements.stepPill1.className = 'step-pill active';
+  elements.stepPill2.className = 'step-pill';
+  elements.batchProgressBar.style.width = '20%';
+  elements.batchProgressText.textContent = 'Шаг 1/2: Анализ характера, пола, тона и составление глоссария...';
+
+  showToast('Шаг 1/2: Анализируем карточку персонажа и формируем паспорт контекста...', 'info', 4000);
 
   try {
-    const translatedDict = await translateFullCard({
+    // Step 1: Context & Glossary Pass
+    const passport = await analyzeCardContext({
       cardData: state.originalCard.data,
       settings: state.settings,
       signal: state.abortController.signal
     });
 
-    elements.batchProgressBar.style.width = '85%';
+    state.passport = passport;
+    renderPassport(passport);
+
+    // Update progress to Step 2
+    elements.stepPill1.className = 'step-pill completed';
+    elements.stepPill2.className = 'step-pill active';
+    elements.batchProgressBar.style.width = '50%';
+    elements.batchProgressText.textContent = `Шаг 2/2: Перевод всех полей и лорбука (${passport.character_name_ru || state.originalCard.data.name}, ${passport.verb_gender}, «${passport.user_pronoun}»)...`;
+
+    showToast(`Шаг 1 завершен: ${passport.character_name_ru || 'Персонаж'} (${passport.gender}, «${passport.user_pronoun}»). Переводим поля...`, 'info', 4000);
+
+    // Step 2: Execution Translation Pass (XML tags + Step 1 passport)
+    const translatedDict = await translateFullCard({
+      cardData: state.originalCard.data,
+      passport: state.passport,
+      settings: state.settings,
+      signal: state.abortController.signal
+    });
+
+    elements.batchProgressBar.style.width = '90%';
 
     let updatedCount = 0;
     for (const [key, val] of Object.entries(translatedDict)) {
@@ -664,6 +883,9 @@ async function handleTranslateAll() {
         } else if (key === 'tags' && Array.isArray(val)) {
           state.translatedCard.data.tags = val;
           updatedCount++;
+        } else if (key === 'character_book' && typeof val === 'object') {
+          state.translatedCard.data.character_book = val;
+          updatedCount++;
         } else if (typeof val === 'string' && val.trim()) {
           state.translatedCard.data[key] = val;
           updatedCount++;
@@ -671,24 +893,32 @@ async function handleTranslateAll() {
       }
     }
 
+    elements.stepPill2.className = 'step-pill completed';
     elements.batchProgressBar.style.width = '100%';
+    elements.batchProgressText.textContent = 'Готово: Перевод успешно завершен!';
+
     renderFields();
     updateCardStats();
-    showToast(`Вся карточка успешно переведена! Обновлено ${updatedCount} полей в едином контексте.`, 'success', 8000);
+    showToast(`Вся карточка успешно переведена! Обновлено ${updatedCount} полей по паспорту контекста.`, 'success', 8000);
   } catch (err) {
-    if (err.message.includes('отменен')) {
+    if (err.name === 'AbortError' || err.message.includes('отменен')) {
       showToast('Перевод был остановлен пользователем.', 'warning');
+      elements.batchProgressText.textContent = 'Перевод остановлен.';
     } else {
       showToast('Ошибка перевода: ' + err.message, 'error', 12000);
+      elements.batchProgressText.textContent = 'Ошибка: ' + err.message;
     }
   } finally {
     state.isTranslating = false;
     state.abortController = null;
     elements.btnTranslateAll.style.display = 'inline-flex';
     elements.btnCancelTranslation.style.display = 'none';
+    elements.btnCopyAllOrig.disabled = false;
     setTimeout(() => {
-      elements.batchProgressContainer.style.display = 'none';
-    }, 1500);
+      if (!state.isTranslating) {
+        elements.batchProgressContainer.style.display = 'none';
+      }
+    }, 2500);
   }
 }
 
@@ -896,9 +1126,29 @@ function updateProviderView(providerId) {
  * Event Listeners Initialization
  */
 function initEvents() {
+  // Toggle Passport summary
+  if (elements.btnTogglePassport) {
+    elements.btnTogglePassport.addEventListener('click', () => {
+      const isHidden = elements.passportContent.style.display === 'none';
+      elements.passportContent.style.display = isHidden ? 'flex' : 'none';
+    });
+  }
+
   // File inputs
-  elements.btnLoadFile.addEventListener('click', () => elements.fileInput.click());
-  elements.btnBrowseCard.addEventListener('click', () => elements.fileInput.click());
+  elements.btnLoadFile.addEventListener('click', () => {
+    if (state.isTranslating) {
+      showToast('Загрузка файла заблокирована во время перевода.', 'warning');
+      return;
+    }
+    elements.fileInput.click();
+  });
+  elements.btnBrowseCard.addEventListener('click', () => {
+    if (state.isTranslating) {
+      showToast('Загрузка файла заблокирована во время перевода.', 'warning');
+      return;
+    }
+    elements.fileInput.click();
+  });
   elements.fileInput.addEventListener('change', (e) => {
     if (e.target.files?.[0]) handleFileUpload(e.target.files[0]);
     e.target.value = '';
@@ -906,11 +1156,21 @@ function initEvents() {
 
   // Demo card
   elements.btnLoadDemo.addEventListener('click', () => {
+    if (state.isTranslating) {
+      showToast('Загрузка карточки заблокирована во время перевода.', 'warning');
+      return;
+    }
     loadCardIntoApp(DEMO_CARD, null, 'Seraphina_Vale');
   });
 
   // Avatar change
-  elements.avatarContainer.addEventListener('click', () => elements.avatarInput.click());
+  elements.avatarContainer.addEventListener('click', () => {
+    if (state.isTranslating) {
+      showToast('Смена аватара заблокирована во время перевода.', 'warning');
+      return;
+    }
+    elements.avatarInput.click();
+  });
   elements.avatarInput.addEventListener('change', (e) => {
     if (e.target.files?.[0]) handleAvatarUpload(e.target.files[0]);
     e.target.value = '';
@@ -926,6 +1186,10 @@ function initEvents() {
 
   // Copy All Original to Translation
   elements.btnCopyAllOrig.addEventListener('click', () => {
+    if (state.isTranslating) {
+      showToast('Копирование оригинала заблокировано во время перевода.', 'warning');
+      return;
+    }
     if (!state.originalCard) return;
     if (confirm('Скопировать все оригинальные поля в колонку перевода? Текущие правки будут перезаписаны.')) {
       state.translatedCard = cloneCard(state.originalCard);
@@ -949,6 +1213,13 @@ function initEvents() {
     const action = target.getAttribute('data-action');
     const key = target.getAttribute('data-key');
     const idx = target.getAttribute('data-idx');
+
+    if (state.isTranslating) {
+      if (action === 'copy-from-orig' || action === 'copy-orig-greeting' || action === 'copy-orig-tags' || action === 'copy-orig-lore-entry' || action === 'clear-field' || action === 'remove-alt-greeting' || action?.startsWith('translate-')) {
+        showToast('Действие заблокировано во время выполнения перевода.', 'warning');
+        return;
+      }
+    }
 
     if (action === 'copy-orig' && key) {
       const val = state.originalCard.data[key];
@@ -992,13 +1263,30 @@ function initEvents() {
       const input = document.getElementById('trans-tags-input');
       if (input) input.value = origTags.join(', ');
       showToast('Теги скопированы из оригинала', 'info', 1500);
+    } else if (action === 'copy-orig-lore-entry' && idx !== null) {
+      const i = parseInt(idx, 10);
+      const origEntry = state.originalCard.data.character_book?.entries?.[i];
+      if (origEntry && state.translatedCard?.data?.character_book?.entries?.[i]) {
+        state.translatedCard.data.character_book.entries[i] = JSON.parse(JSON.stringify(origEntry));
+        renderFields();
+        updateCardStats();
+        showToast(`Запись лорбука #${i + 1} скопирована из оригинала`, 'info', 1500);
+      }
+    } else if (action === 'copy-orig' && key === 'lorebook_all') {
+      const origBook = state.originalCard.data.character_book;
+      if (origBook) {
+        navigator.clipboard.writeText(JSON.stringify(origBook, null, 2));
+        showToast('Лорбук скопирован в буфер в формате JSON!', 'info', 2000);
+      }
     }
   });
 
   // Drag and Drop (Global Window)
   window.addEventListener('dragenter', (e) => {
     e.preventDefault();
-    elements.dragOverlay.classList.add('active');
+    if (!state.isTranslating) {
+      elements.dragOverlay.classList.add('active');
+    }
   });
 
   elements.dragOverlay.addEventListener('dragleave', (e) => {
@@ -1013,6 +1301,10 @@ function initEvents() {
   window.addEventListener('drop', (e) => {
     e.preventDefault();
     elements.dragOverlay.classList.remove('active');
+    if (state.isTranslating) {
+      showToast('Загрузка файла заблокирована во время выполнения перевода.', 'warning');
+      return;
+    }
     if (e.dataTransfer.files?.[0]) {
       handleFileUpload(e.dataTransfer.files[0]);
     }

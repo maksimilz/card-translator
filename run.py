@@ -7,6 +7,7 @@ import webbrowser
 import ssl
 import json
 import gzip
+import ipaddress
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -23,10 +24,19 @@ IGNORED_FORWARD_HEADERS = {
 
 class ProxyAndStaticServer(SimpleHTTPRequestHandler):
     def end_headers(self):
-        # Enable CORS for all local requests
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, DELETE')
-        self.send_header('Access-Control-Allow-Headers', '*')
+        origin = self.headers.get('Origin')
+        if origin:
+            try:
+                parsed_origin = urllib.parse.urlparse(origin)
+                # Allow only local origins (http://localhost:* or http://127.0.0.1:*)
+                if parsed_origin.scheme == 'http' and parsed_origin.hostname in ('127.0.0.1', 'localhost', '::1'):
+                    self.send_header('Access-Control-Allow-Origin', origin)
+                    self.send_header('Vary', 'Origin')
+                    self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, DELETE')
+                    self.send_header('Access-Control-Allow-Headers', '*')
+                    self.send_header('Access-Control-Max-Age', '86400')
+            except Exception:
+                pass
         super().end_headers()
 
     def do_OPTIONS(self):
@@ -55,6 +65,47 @@ class ProxyAndStaticServer(SimpleHTTPRequestHandler):
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
             self.wfile.write(b'{"error": "Missing target parameter in query string"}')
+            return
+
+        parsed_target = urllib.parse.urlparse(target_url)
+        scheme = (parsed_target.scheme or '').lower()
+        if scheme not in ('http', 'https'):
+            self.send_response(400)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(b'{"error": "Invalid scheme: only http and https are allowed"}')
+            return
+
+        hostname = (parsed_target.hostname or '').lower()
+        if not hostname:
+            self.send_response(400)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(b'{"error": "Invalid target host"}')
+            return
+
+        # Block cloud metadata IPs and link-local addresses (SSRF protection)
+        norm_host = hostname.rstrip('.')
+        is_metadata = (
+            norm_host in ('metadata.google.internal', 'metadata', 'instance-data')
+            or norm_host.endswith('.metadata.google.internal')
+        )
+        if not is_metadata:
+            try:
+                ip_obj = ipaddress.ip_address(norm_host)
+                if ip_obj.version == 6 and getattr(ip_obj, 'ipv4_mapped', None):
+                    ip_obj = ip_obj.ipv4_mapped
+                if ip_obj.is_link_local or str(ip_obj).startswith('169.254.'):
+                    is_metadata = True
+            except ValueError:
+                if norm_host == '169.254.169.254' or norm_host.startswith('169.254.'):
+                    is_metadata = True
+
+        if is_metadata:
+            self.send_response(403)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(b'{"error": "Access to cloud metadata IP (169.254.169.254) is forbidden"}')
             return
 
         content_length = int(self.headers.get('Content-Length', 0))
