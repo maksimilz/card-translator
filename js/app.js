@@ -666,68 +666,86 @@ async function handleTranslateAll() {
   elements.batchProgressBar.style.width = '0%';
 
   let completed = 0;
+  let successCount = 0;
+  const failedFields = [];
+
   showToast(`Запущен перевод карточки (${fieldsToTranslate.length} полей)...`, 'info');
 
   try {
     for (const item of fieldsToTranslate) {
       if (state.abortController?.signal.aborted) break;
 
-      if (item.type === 'standard') {
-        const origText = state.originalCard.data[item.key];
-        const res = await translateText({
-          text: origText,
-          fieldLabel: item.label,
-          charName: state.translatedCard.data.name || state.originalCard.data.name,
-          settings: state.settings,
-          signal: state.abortController.signal
-        });
-        state.translatedCard.data[item.key] = res;
-        const elem = document.getElementById(`trans-input-${item.key}`);
-        if (elem) {
-          elem.value = res;
-          if (item.key === 'name') elements.bannerCharName.textContent = res;
+      try {
+        if (item.type === 'standard') {
+          const origText = state.originalCard.data[item.key];
+          const res = await translateText({
+            text: origText,
+            fieldLabel: item.label,
+            charName: state.translatedCard.data.name || state.originalCard.data.name,
+            settings: state.settings,
+            signal: state.abortController.signal
+          });
+          state.translatedCard.data[item.key] = res;
+          const elem = document.getElementById(`trans-input-${item.key}`);
+          if (elem) {
+            elem.value = res;
+            if (item.key === 'name') elements.bannerCharName.textContent = res;
+          }
+        } else if (item.type === 'alt_greeting') {
+          const origText = state.originalCard.data.alternate_greetings[item.idx];
+          const res = await translateText({
+            text: origText,
+            fieldLabel: item.label,
+            charName: state.translatedCard.data.name || state.originalCard.data.name,
+            settings: state.settings,
+            signal: state.abortController.signal
+          });
+          state.translatedCard.data.alternate_greetings[item.idx] = res;
+          const elem = document.querySelector(`.greeting-item textarea[data-idx="${item.idx}"]`);
+          if (elem) elem.value = res;
+        } else if (item.type === 'tags') {
+          const origTags = state.originalCard.data.tags || [];
+          const origText = Array.isArray(origTags) ? origTags.join(', ') : String(origTags);
+          const res = await translateText({
+            text: origText,
+            fieldLabel: item.label,
+            charName: state.translatedCard.data.name || state.originalCard.data.name,
+            settings: state.settings,
+            signal: state.abortController.signal
+          });
+          const parsed = res.split(',').map(t => t.trim()).filter(Boolean);
+          state.translatedCard.data.tags = parsed;
+          const elem = document.getElementById('trans-tags-input');
+          if (elem) elem.value = parsed.join(', ');
         }
-      } else if (item.type === 'alt_greeting') {
-        const origText = state.originalCard.data.alternate_greetings[item.idx];
-        const res = await translateText({
-          text: origText,
-          fieldLabel: item.label,
-          charName: state.translatedCard.data.name || state.originalCard.data.name,
-          settings: state.settings,
-          signal: state.abortController.signal
-        });
-        state.translatedCard.data.alternate_greetings[item.idx] = res;
-        const elem = document.querySelector(`.greeting-item textarea[data-idx="${item.idx}"]`);
-        if (elem) elem.value = res;
-      } else if (item.type === 'tags') {
-        const origTags = state.originalCard.data.tags || [];
-        const origText = Array.isArray(origTags) ? origTags.join(', ') : String(origTags);
-        const res = await translateText({
-          text: origText,
-          fieldLabel: item.label,
-          charName: state.translatedCard.data.name || state.originalCard.data.name,
-          settings: state.settings,
-          signal: state.abortController.signal
-        });
-        const parsed = res.split(',').map(t => t.trim()).filter(Boolean);
-        state.translatedCard.data.tags = parsed;
-        const elem = document.getElementById('trans-tags-input');
-        if (elem) elem.value = parsed.join(', ');
+        successCount++;
+      } catch (fieldErr) {
+        if (fieldErr.message.includes('отменен')) {
+          break;
+        }
+        console.error(`Field translation error [${item.label}]:`, fieldErr);
+        failedFields.push(item.label);
+        showToast(`Поле «${item.label}» не переведено: ${fieldErr.message}`, 'warning', 8000);
       }
 
       completed++;
       const percent = Math.round((completed / fieldsToTranslate.length) * 100);
       elements.batchProgressBar.style.width = `${percent}%`;
       updateCardStats();
+
+      // Small pause between requests
+      await new Promise(r => setTimeout(r, 400));
     }
 
-    showToast('Перевод всей карточки успешно завершен!', 'success');
-  } catch (err) {
-    if (err.message.includes('отменен')) {
+    if (state.abortController?.signal.aborted) {
       showToast('Перевод был остановлен пользователем.', 'warning');
+    } else if (failedFields.length === 0) {
+      showToast(`Перевод всех полей (${successCount}) успешно завершен!`, 'success');
     } else {
-      showToast('Ошибка пакетного перевода: ' + err.message, 'error');
+      showToast(`Переведено ${successCount} из ${fieldsToTranslate.length} полей. Непереведенные поля можно доперевести кнопкой «Перевести» рядом с ними.`, 'info', 10000);
     }
+  } catch (err) {
+    showToast('Ошибка пакетного перевода: ' + err.message, 'error');
   } finally {
     state.isTranslating = false;
     state.abortController = null;

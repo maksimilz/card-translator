@@ -71,7 +71,7 @@ class ProxyAndStaticServer(SimpleHTTPRequestHandler):
 
         try:
             req = urllib.request.Request(target_url, data=body, headers=forward_headers, method=self.command)
-            with urllib.request.urlopen(req, context=SSL_CTX, timeout=35) as resp:
+            with urllib.request.urlopen(req, context=SSL_CTX, timeout=180) as resp:
                 status = resp.status
                 resp_headers = resp.headers
                 resp_data = resp.read()
@@ -101,11 +101,18 @@ class ProxyAndStaticServer(SimpleHTTPRequestHandler):
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
             self.wfile.write(err_data)
+        except (TimeoutError, socket.timeout):
+            self.send_response(504)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            err_msg = json.dumps({"error": {"message": "Превышено время ожидания ответа (таймаут 180 сек). Попробуйте перевести это поле отдельно."}})
+            self.wfile.write(err_msg.encode('utf-8'))
         except Exception as e:
             self.send_response(502)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
-            err_msg = f'{{"error": {{"message": "Proxy connection error: {str(e)}"}} }}'
+            err_detail = str(e).strip() or repr(e)
+            err_msg = json.dumps({"error": {"message": f"Proxy connection error: {err_detail}"}})
             self.wfile.write(err_msg.encode('utf-8'))
 
     def log_message(self, format, *args):
