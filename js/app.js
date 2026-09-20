@@ -17,7 +17,9 @@ import {
   serializeV2Card,
   calculateCardStats,
   countStats,
-  TRANSLATABLE_FIELDS
+  TRANSLATABLE_FIELDS,
+  replaceSubObj,
+  hasSubObjMacros
 } from './card-parser.js';
 
 import {
@@ -26,6 +28,8 @@ import {
   translateText,
   translateFullCard,
   analyzeCardContext,
+  askCharacterAI,
+  transformCharacterAI,
   fetchAvailableModels,
   PROVIDER_PRESETS,
   DEFAULT_PROMPT_RU
@@ -42,7 +46,8 @@ const state = {
   settings: loadSettings(),
   abortController: null,
   isTranslating: false,
-  passport: null
+  passport: null,
+  pendingTransform: null
 };
 
 // Built-in Demo Card for quick testing
@@ -138,10 +143,86 @@ const elements = {
   btnResetPrompt: document.getElementById('btn-reset-prompt'),
   settingTemperature: document.getElementById('setting-temperature'),
   settingMaxTokens: document.getElementById('setting-max-tokens'),
+  // Assistant Modal
+  btnOpenAssistant: document.getElementById('btn-open-assistant'),
+  assistantModal: document.getElementById('assistant-modal'),
+  btnCloseAssistant: document.getElementById('btn-close-assistant'),
+  btnDismissAssistant: document.getElementById('btn-dismiss-assistant'),
+  tabBtnAsk: document.getElementById('tab-btn-ask'),
+  tabBtnTransform: document.getElementById('tab-btn-transform'),
+  paneAsk: document.getElementById('pane-ask'),
+  paneTransform: document.getElementById('pane-transform'),
+  assistantQuestionInput: document.getElementById('assistant-question-input'),
+  btnSendQuestion: document.getElementById('btn-send-question'),
+  assistantAskResultBox: document.getElementById('assistant-ask-result-box'),
+  assistantAskResultText: document.getElementById('assistant-ask-result-text'),
+  btnCopyAskResult: document.getElementById('btn-copy-ask-result'),
+  assistantTransformInput: document.getElementById('assistant-transform-input'),
+  assistantSourceSelect: document.getElementById('assistant-source-select'),
+  btnExecuteTransform: document.getElementById('btn-execute-transform'),
+  assistantTransformResultBox: document.getElementById('assistant-transform-result-box'),
+  transformSummaryText: document.getElementById('transform-summary-text'),
+  transformDiffList: document.getElementById('transform-diff-list'),
+  btnApplyTransform: document.getElementById('btn-apply-transform'),
+  assistantStatusText: document.getElementById('assistant-status-text'),
+  // Console Drawer
+  btnToggleConsole: document.getElementById('btn-toggle-console'),
+  logCountBadge: document.getElementById('log-count-badge'),
+  logConsoleDrawer: document.getElementById('log-console-drawer'),
+  logConsoleBody: document.getElementById('log-console-body'),
+  btnCopyLogs: document.getElementById('btn-copy-logs'),
+  btnClearLogs: document.getElementById('btn-clear-logs'),
+  btnCloseLogConsole: document.getElementById('btn-close-log-console'),
   // Overlay & Toasts
   dragOverlay: document.getElementById('drag-overlay'),
   toastContainer: document.getElementById('toast-container')
 };
+
+// Logging System (Outputs to both DevTools console and In-App Log Drawer)
+let logCounter = 0;
+const logBuffer = [];
+
+export function appLog(message, type = 'info') {
+  const now = new Date();
+  const timeStr = now.toTimeString().split(' ')[0];
+  logCounter++;
+
+  // 1. Output to browser DevTools console with distinct styling
+  const styles = {
+    info: 'color: #818cf8; font-weight: bold;',
+    success: 'color: #34d399; font-weight: bold;',
+    warning: 'color: #fbbf24; font-weight: bold;',
+    error: 'color: #f87171; font-weight: bold;'
+  };
+  const tag = `[CardTranslator ${timeStr}]`;
+  if (type === 'error') {
+    console.error(`%c${tag}%c ${message}`, styles[type] || styles.info, 'color: inherit;');
+  } else if (type === 'warning') {
+    console.warn(`%c${tag}%c ${message}`, styles[type] || styles.info, 'color: inherit;');
+  } else {
+    console.log(`%c${tag}%c ${message}`, styles[type] || styles.info, 'color: inherit;');
+  }
+
+  // 2. Output to in-app log drawer
+  if (elements.logCountBadge) {
+    elements.logCountBadge.textContent = logCounter;
+    elements.logCountBadge.style.display = 'inline-block';
+  }
+
+  logBuffer.push(`[${timeStr}] [${type.toUpperCase()}] ${message}`);
+
+  if (elements.logConsoleBody) {
+    const row = document.createElement('div');
+    row.className = 'log-entry';
+    row.innerHTML = `
+      <span class="log-time">[${timeStr}]</span>
+      <span class="log-badge ${type}">${type.toUpperCase()}</span>
+      <span class="log-text">${escapeHtml(message)}</span>
+    `;
+    elements.logConsoleBody.appendChild(row);
+    elements.logConsoleBody.scrollTop = elements.logConsoleBody.scrollHeight;
+  }
+}
 
 /**
  * Toast Notifications
@@ -264,6 +345,7 @@ async function loadCardIntoApp(cardJson, imageBytes = null, fileName = 'characte
       state.avatarUrl = null;
     }
 
+    const hadSubObj = hasSubObjMacros(cardJson);
     const normalized = normalizeCard(cardJson);
     state.originalCard = cloneCard(normalized);
     state.translatedCard = cloneCard(normalized);
@@ -295,8 +377,17 @@ async function loadCardIntoApp(cardJson, imageBytes = null, fileName = 'characte
     renderFields();
     updateCardStats();
     showToast(`Карточка «${state.originalCard.data.name || 'Персонаж'}» успешно загружена!`, 'success');
+    const stats = calculateCardStats(state.originalCard);
+    const loreCount = state.originalCard.data.character_book?.entries?.length || 0;
+    const loreInfo = loreCount > 0 ? `, лорбук: ${loreCount} записей` : '';
+    appLog(`Карточка «${state.originalCard.data.name || 'Безымянный'}» загружена (${state.originalCard.spec}, ~${stats.estimatedTokens} токенов${loreInfo}).`, 'success');
+    if (hadSubObj) {
+      showToast('Макросы JanitorAI ({{sub}} / {{obj}}) автоматически заменены на {{user}}!', 'info', 4500);
+      appLog('Обнаружены макросы JanitorAI {{sub}} / {{obj}}: успешно заменены на {{user}}.', 'info');
+    }
   } catch (err) {
     showToast('Ошибка при загрузке карточки: ' + err.message, 'error');
+    appLog('Ошибка при загрузке карточки: ' + err.message, 'error');
   }
 }
 
@@ -453,7 +544,10 @@ function renderLorebook(origBook, transBook) {
       <div class="greeting-item" style="margin-bottom: 12px;" data-lore-idx="${idx}">
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 6px;">
           <span style="font-size: 0.8rem; font-weight: 600; color: #a5b4fc;">Запись #${idx + 1}: ${escapeHtml(entry.comment || '')}</span>
-          <button class="btn btn-secondary btn-sm" data-action="copy-orig-lore-entry" data-idx="${idx}" type="button">Копировать из оригинала</button>
+          <div class="field-actions">
+            <button class="btn btn-secondary btn-sm" data-action="copy-orig-lore-entry" data-idx="${idx}" type="button">Копировать из оригинала</button>
+            <button class="btn btn-danger btn-sm" data-action="remove-lore-entry" data-idx="${idx}" type="button">Удалить</button>
+          </div>
         </div>
         <div style="margin-bottom: 6px;">
           <label style="font-size: 0.75rem; color: var(--text-dim); display:block; margin-bottom: 2px;">Ключи активации (через запятую):</label>
@@ -470,10 +564,34 @@ function renderLorebook(origBook, transBook) {
   transBox.innerHTML = `
     <div class="field-header">
       <span class="field-label">Лорбук / База знаний (${escapeHtml((transBook && transBook.name) || origBook.name || 'Lorebook')})</span>
+      <div class="field-actions">
+        <button class="btn btn-secondary btn-sm" id="btn-add-lore-entry" type="button">+ Добавить запись</button>
+      </div>
     </div>
     <div class="greetings-list" id="trans-lorebook-list">${transEntriesHtml}</div>
   `;
   elements.transFieldsContainer.appendChild(transBox);
+
+  const addLoreBtn = transBox.querySelector('#btn-add-lore-entry');
+  if (addLoreBtn) {
+    addLoreBtn.addEventListener('click', () => {
+      if (!state.translatedCard.data.character_book) {
+        state.translatedCard.data.character_book = { name: 'Lorebook', description: '', entries: [] };
+      }
+      if (!Array.isArray(state.translatedCard.data.character_book.entries)) {
+        state.translatedCard.data.character_book.entries = [];
+      }
+      state.translatedCard.data.character_book.entries.push({
+        keys: [],
+        content: '',
+        comment: `Запись #${state.translatedCard.data.character_book.entries.length + 1}`,
+        enabled: true
+      });
+      renderFields();
+      updateCardStats();
+      showToast('Добавлена новая запись в лорбук.', 'info', 2000);
+    });
+  }
 
   // Event listeners for translated lorebook inputs
   transBox.querySelectorAll('[data-lore-keys-idx]').forEach(input => {
@@ -671,6 +789,7 @@ async function handleTranslateField(fieldKey) {
 
   state.isTranslating = true;
   state.abortController = new AbortController();
+  appLog(`Одиночный перевод поля «${fieldLabel}» начат.`);
 
   try {
     const translated = await translateText({
@@ -701,8 +820,10 @@ async function handleTranslateField(fieldKey) {
     }
     updateCardStats();
     showToast(`Поле «${fieldLabel}» успешно переведено!`, 'success');
+    appLog(`Поле «${fieldLabel}» переведено (${translated.length} симв.).`, 'success');
   } catch (err) {
     showToast(err.message, 'error');
+    appLog(`Ошибка перевода поля «${fieldLabel}»: ${err.message}`, 'error');
   } finally {
     state.isTranslating = false;
     state.abortController = null;
@@ -736,6 +857,7 @@ async function handleTranslateAltGreeting(idx) {
 
   state.abortController = new AbortController();
   state.isTranslating = true;
+  appLog(`Перевод альтернативного приветствия #${idx + 1} начат.`);
 
   try {
     const translated = await translateText({
@@ -756,8 +878,10 @@ async function handleTranslateAltGreeting(idx) {
     if (textarea) textarea.value = translated;
     updateCardStats();
     showToast(`Приветствие #${idx + 1} переведено!`, 'success');
+    appLog(`Альтернативное приветствие #${idx + 1} переведено.`, 'success');
   } catch (err) {
     showToast(err.message, 'error');
+    appLog(`Ошибка перевода приветствия #${idx + 1}: ${err.message}`, 'error');
   } finally {
     state.isTranslating = false;
     state.abortController = null;
@@ -792,6 +916,7 @@ async function handleTranslateTags() {
 
   state.abortController = new AbortController();
   state.isTranslating = true;
+  appLog('Перевод тегов начат.');
 
   try {
     const translated = await translateText({
@@ -808,8 +933,10 @@ async function handleTranslateTags() {
     const input = document.getElementById('trans-tags-input');
     if (input) input.value = parsedTags.join(', ');
     showToast('Теги успешно переведены!', 'success');
+    appLog(`Теги успешно переведены: ${parsedTags.join(', ')}`, 'success');
   } catch (err) {
     showToast(err.message, 'error');
+    appLog(`Ошибка перевода тегов: ${err.message}`, 'error');
   } finally {
     state.isTranslating = false;
     state.abortController = null;
@@ -844,6 +971,7 @@ async function handleTranslateAll() {
   elements.batchProgressText.textContent = 'Шаг 1/2: Анализ характера, пола, тона и составление глоссария...';
 
   showToast('Шаг 1/2: Анализируем карточку персонажа и формируем паспорт контекста...', 'info', 4000);
+  appLog(`Начат перевод карточки «${state.originalCard.data.name || 'Персонаж'}» (Провайдер: ${state.settings.provider}, Модель: ${state.settings.model}).`);
 
   try {
     // Step 1: Context & Glossary Pass
@@ -855,6 +983,7 @@ async function handleTranslateAll() {
 
     state.passport = passport;
     renderPassport(passport);
+    appLog(`Шаг 1: Паспорт контекста готов: ${passport.character_name_ru} (${passport.gender}, глаголы: ${passport.verb_gender}, обращение: "${passport.user_pronoun}"). Терминов: ${Object.keys(passport.glossary || {}).length}.`, 'success');
 
     // Update progress to Step 2
     elements.stepPill1.className = 'step-pill completed';
@@ -864,12 +993,17 @@ async function handleTranslateAll() {
 
     showToast(`Шаг 1 завершен: ${passport.character_name_ru || 'Персонаж'} (${passport.gender}, «${passport.user_pronoun}»). Переводим поля...`, 'info', 4000);
 
-    // Step 2: Execution Translation Pass (XML tags + Step 1 passport)
+    // Step 2: Execution Translation Pass (XML tags + Step 1 passport + chunked lorebook)
     const translatedDict = await translateFullCard({
       cardData: state.originalCard.data,
       passport: state.passport,
       settings: state.settings,
-      signal: state.abortController.signal
+      signal: state.abortController.signal,
+      onProgress: ({ percent, message }) => {
+        elements.batchProgressBar.style.width = `${percent}%`;
+        elements.batchProgressText.textContent = message;
+        appLog(message, 'info');
+      }
     });
 
     elements.batchProgressBar.style.width = '90%';
@@ -900,13 +1034,16 @@ async function handleTranslateAll() {
     renderFields();
     updateCardStats();
     showToast(`Вся карточка успешно переведена! Обновлено ${updatedCount} полей по паспорту контекста.`, 'success', 8000);
+    appLog(`Шаг 2: Перевод карточки завершен! Обновлено ${updatedCount} полей.`, 'success');
   } catch (err) {
     if (err.name === 'AbortError' || err.message.includes('отменен')) {
       showToast('Перевод был остановлен пользователем.', 'warning');
       elements.batchProgressText.textContent = 'Перевод остановлен.';
+      appLog('Перевод остановлен пользователем.', 'warning');
     } else {
       showToast('Ошибка перевода: ' + err.message, 'error', 12000);
       elements.batchProgressText.textContent = 'Ошибка: ' + err.message;
+      appLog('Ошибка перевода: ' + err.message, 'error');
     }
   } finally {
     state.isTranslating = false;
@@ -952,8 +1089,10 @@ function downloadTranslatedPNG() {
       .replace(/[^a-zA-Z0-9а-яА-ЯёЁ_-]/g, '_');
     triggerDownload(blob, `${name}_RU.png`);
     showToast(`Переведенная карточка «${name}_RU.png» сохранена!`, 'success');
+    appLog(`Экспорт: сохранена переведенная карточка «${name}_RU.png» (${(blob.size / 1024).toFixed(1)} КБ).`, 'success');
   } catch (err) {
     showToast('Ошибка при сборке PNG: ' + err.message, 'error');
+    appLog('Ошибка при сборке PNG: ' + err.message, 'error');
   }
 }
 
@@ -970,6 +1109,7 @@ function downloadTranslatedJSON() {
     .replace(/[^a-zA-Z0-9а-яА-ЯёЁ_-]/g, '_');
   triggerDownload(blob, `${name}_RU.json`);
   showToast(`JSON перевода «${name}_RU.json» сохранен!`, 'success');
+  appLog(`Экспорт: сохранен JSON перевода «${name}_RU.json» (${(blob.size / 1024).toFixed(1)} КБ).`, 'success');
 }
 
 /**
@@ -986,8 +1126,10 @@ function downloadOriginalPNG() {
       .replace(/[^a-zA-Z0-9а-яА-ЯёЁ_-]/g, '_');
     triggerDownload(blob, `${name}_ORIGINAL.png`);
     showToast(`Оригинальная карточка «${name}_ORIGINAL.png» сохранена!`, 'success');
+    appLog(`Экспорт: сохранена оригинальная карточка «${name}_ORIGINAL.png».`, 'info');
   } catch (err) {
     showToast('Ошибка при экспорте оригинала: ' + err.message, 'error');
+    appLog('Ошибка при экспорте оригинала: ' + err.message, 'error');
   }
 }
 
@@ -1004,6 +1146,7 @@ function downloadOriginalJSON() {
     .replace(/[^a-zA-Z0-9а-яА-ЯёЁ_-]/g, '_');
   triggerDownload(blob, `${name}_ORIGINAL.json`);
   showToast(`Оригинальный JSON «${name}_ORIGINAL.json» сохранен!`, 'success');
+  appLog(`Экспорт: сохранен оригинальный JSON «${name}_ORIGINAL.json».`, 'info');
 }
 
 /**
@@ -1014,6 +1157,7 @@ async function handleFileUpload(file) {
 
   const fileName = file.name;
   const ext = fileName.split('.').pop().toLowerCase();
+  appLog(`Загрузка файла: ${fileName} (${(file.size / 1024).toFixed(1)} КБ)...`);
 
   if (ext === 'png') {
     try {
@@ -1023,6 +1167,7 @@ async function handleFileUpload(file) {
       await loadCardIntoApp(cardJson, bytes, fileName);
     } catch (err) {
       showToast('Ошибка при чтении PNG: ' + err.message, 'error');
+      appLog('Ошибка при чтении PNG: ' + err.message, 'error');
     }
   } else if (ext === 'json') {
     try {
@@ -1031,9 +1176,11 @@ async function handleFileUpload(file) {
       await loadCardIntoApp(cardJson, null, fileName);
     } catch (err) {
       showToast('Ошибка парсинга JSON файла: ' + err.message, 'error');
+      appLog('Ошибка парсинга JSON файла: ' + err.message, 'error');
     }
   } else {
     showToast('Поддерживаются только форматы PNG и JSON', 'warning');
+    appLog(`Неподдерживаемый формат файла: ${ext}`, 'warning');
   }
 }
 
@@ -1051,8 +1198,10 @@ async function handleAvatarUpload(file) {
     state.avatarUrl = URL.createObjectURL(blob);
     elements.charAvatar.src = state.avatarUrl;
     showToast('Аватар персонажа успешно обновлен!', 'success');
+    appLog(`Аватар персонажа обновлен (${(file.size / 1024).toFixed(1)} КБ).`, 'info');
   } catch (err) {
     showToast('Ошибка при смене аватара: ' + err.message, 'error');
+    appLog('Ошибка при смене аватара: ' + err.message, 'error');
   }
 }
 
@@ -1272,6 +1421,14 @@ function initEvents() {
         updateCardStats();
         showToast(`Запись лорбука #${i + 1} скопирована из оригинала`, 'info', 1500);
       }
+    } else if (action === 'remove-lore-entry' && idx !== null) {
+      const i = parseInt(idx, 10);
+      if (state.translatedCard?.data?.character_book?.entries?.[i] !== undefined) {
+        state.translatedCard.data.character_book.entries.splice(i, 1);
+        renderFields();
+        updateCardStats();
+        showToast(`Запись #${i + 1} удалена из лорбука.`, 'info', 1500);
+      }
     } else if (action === 'copy-orig' && key === 'lorebook_all') {
       const origBook = state.originalCard.data.character_book;
       if (origBook) {
@@ -1409,7 +1566,7 @@ function initEvents() {
       model: chosenModel,
       systemPrompt: elements.settingSystemPrompt.value.trim(),
       temperature: parseFloat(elements.settingTemperature.value) || 0.3,
-      maxTokens: parseInt(elements.settingMaxTokens.value, 10) || 4096
+      maxTokens: parseInt(elements.settingMaxTokens.value, 10) || 8192
     };
 
     saveSettings(state.settings);
@@ -1417,10 +1574,252 @@ function initEvents() {
     closeSettings();
     showToast('Настройки успешно сохранены!', 'success');
   });
+
+  // Assistant Modal Controls
+  const openAssistantModal = () => {
+    if (!state.originalCard) {
+      showToast('Сначала откройте или загрузите карточку персонажа.', 'warning');
+      return;
+    }
+    elements.assistantStatusText.textContent = 'Готов к работе';
+    elements.assistantModal.classList.add('active');
+  };
+
+  const closeAssistantModal = () => {
+    elements.assistantModal.classList.remove('active');
+  };
+
+  const switchAssistantTab = (targetTab) => {
+    if (targetTab === 'ask') {
+      elements.tabBtnAsk.classList.add('active');
+      elements.tabBtnTransform.classList.remove('active');
+      elements.paneAsk.style.display = 'flex';
+      elements.paneTransform.style.display = 'none';
+    } else if (targetTab === 'transform') {
+      elements.tabBtnTransform.classList.add('active');
+      elements.tabBtnAsk.classList.remove('active');
+      elements.paneTransform.style.display = 'flex';
+      elements.paneAsk.style.display = 'none';
+    }
+  };
+
+  elements.btnOpenAssistant.addEventListener('click', openAssistantModal);
+  elements.btnCloseAssistant.addEventListener('click', closeAssistantModal);
+  elements.btnDismissAssistant.addEventListener('click', closeAssistantModal);
+
+  elements.tabBtnAsk.addEventListener('click', () => switchAssistantTab('ask'));
+  elements.tabBtnTransform.addEventListener('click', () => switchAssistantTab('transform'));
+
+  // Quick Chips for Question / Analysis
+  document.querySelectorAll('#ask-chips-container .prompt-chip').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const q = btn.getAttribute('data-ask');
+      if (q) {
+        elements.assistantQuestionInput.value = q;
+        elements.assistantQuestionInput.focus();
+      }
+    });
+  });
+
+  // Quick Chips for Transformation
+  document.querySelectorAll('#transform-chips-container .prompt-chip').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const t = btn.getAttribute('data-transform');
+      if (t) {
+        elements.assistantTransformInput.value = t;
+        elements.assistantTransformInput.focus();
+      }
+    });
+  });
+
+  // Send Question to AI
+  elements.btnSendQuestion.addEventListener('click', async () => {
+    const question = elements.assistantQuestionInput.value.trim();
+    if (!question) {
+      showToast('Пожалуйста, введите ваш вопрос.', 'warning');
+      return;
+    }
+    if (!state.originalCard) {
+      showToast('Карточка не загружена.', 'warning');
+      return;
+    }
+
+    elements.btnSendQuestion.disabled = true;
+    elements.btnSendQuestion.innerHTML = '⏳ Анализируем...';
+    elements.assistantStatusText.textContent = 'ИИ анализирует карточку...';
+    appLog(`ИИ-Ассистент: вопрос «${question.length > 50 ? question.slice(0, 50) + '...' : question}» отправлен в LLM.`);
+
+    const cardSource = state.translatedCard?.data?.name ? state.translatedCard.data : state.originalCard.data;
+    const abortCtrl = new AbortController();
+
+    try {
+      const answer = await askCharacterAI({
+        cardData: cardSource,
+        question,
+        settings: state.settings,
+        signal: abortCtrl.signal
+      });
+
+      elements.assistantAskResultText.textContent = answer;
+      elements.assistantAskResultBox.style.display = 'block';
+      elements.assistantStatusText.textContent = 'Ответ готов';
+      showToast('ИИ подготовил разбор карточки!', 'success');
+      appLog(`ИИ-Ассистент: получен ответ (${answer.length} симв.).`, 'success');
+    } catch (err) {
+      showToast('Ошибка: ' + err.message, 'error');
+      elements.assistantStatusText.textContent = 'Ошибка запроса';
+      appLog(`ИИ-Ассистент: ошибка: ${err.message}`, 'error');
+    } finally {
+      elements.btnSendQuestion.disabled = false;
+      elements.btnSendQuestion.innerHTML = '🚀 Спросить ИИ';
+    }
+  });
+
+  // Copy Ask Result
+  elements.btnCopyAskResult.addEventListener('click', () => {
+    const text = elements.assistantAskResultText.textContent;
+    if (text) {
+      navigator.clipboard.writeText(text);
+      showToast('Ответ скопирован в буфер обмена!', 'info', 2000);
+    }
+  });
+
+  // Execute Transformation
+  elements.btnExecuteTransform.addEventListener('click', async () => {
+    const instruction = elements.assistantTransformInput.value.trim();
+    if (!instruction) {
+      showToast('Пожалуйста, опишите задачу по изменению персонажа.', 'warning');
+      return;
+    }
+    if (!state.originalCard) {
+      showToast('Карточка не загружена.', 'warning');
+      return;
+    }
+
+    elements.btnExecuteTransform.disabled = true;
+    elements.btnExecuteTransform.innerHTML = '⏳ Трансформация...';
+    elements.assistantStatusText.textContent = 'ИИ перерабатывает карточку...';
+    appLog(`ИИ-Ассистент: трансформация по задаче «${instruction.length > 50 ? instruction.slice(0, 50) + '...' : instruction}» запущена.`);
+
+    const useTranslated = elements.assistantSourceSelect.value === 'translated';
+    const sourceCard = (useTranslated && state.translatedCard) ? state.translatedCard.data : state.originalCard.data;
+    const abortCtrl = new AbortController();
+
+    try {
+      const result = await transformCharacterAI({
+        cardData: sourceCard,
+        instruction,
+        settings: state.settings,
+        signal: abortCtrl.signal
+      });
+
+      state.pendingTransform = result;
+      elements.transformSummaryText.textContent = result.changesSummary;
+      elements.transformDiffList.innerHTML = '';
+
+      const labels = {
+        name: 'Имя',
+        description: 'Описание',
+        personality: 'Личность',
+        scenario: 'Сценарий',
+        first_mes: 'Первое сообщение',
+        mes_example: 'Примеры диалогов',
+        system_prompt: 'Системный промпт'
+      };
+
+      for (const [key, val] of Object.entries(result.modifiedFields)) {
+        if (!val) continue;
+        const item = document.createElement('div');
+        item.className = 'diff-card-item';
+        item.innerHTML = `
+          <div class="diff-card-header">
+            <span>${labels[key] || key}</span>
+            <span style="font-size: 0.7rem; color: var(--text-dim);">${val.length} симв.</span>
+          </div>
+          <div class="diff-card-text">${escapeHtml(val)}</div>
+        `;
+        elements.transformDiffList.appendChild(item);
+      }
+
+      elements.assistantTransformResultBox.style.display = 'block';
+      elements.assistantStatusText.textContent = 'Трансформация готова к применению';
+      showToast('Трансформация готова! Ознакомьтесь и нажмите «Применить».', 'success');
+      appLog(`ИИ-Ассистент: трансформация завершена (${Object.keys(result.modifiedFields).length} полей затронуто).`, 'success');
+    } catch (err) {
+      showToast('Ошибка трансформации: ' + err.message, 'error');
+      elements.assistantStatusText.textContent = 'Ошибка трансформации';
+      appLog(`ИИ-Ассистент: ошибка трансформации: ${err.message}`, 'error');
+    } finally {
+      elements.btnExecuteTransform.disabled = false;
+      elements.btnExecuteTransform.innerHTML = '⚡ Выполнить трансформацию';
+    }
+  });
+
+  // Apply Transformation Changes
+  elements.btnApplyTransform.addEventListener('click', () => {
+    if (!state.pendingTransform || !state.pendingTransform.modifiedFields) return;
+
+    const modified = state.pendingTransform.modifiedFields;
+    let count = 0;
+
+    for (const [key, val] of Object.entries(modified)) {
+      if (val !== undefined && val !== null) {
+        state.translatedCard.data[key] = val;
+        count++;
+      }
+    }
+
+    if (modified.name) {
+      elements.bannerCharName.textContent = modified.name;
+    }
+
+    renderFields();
+    updateCardStats();
+    closeAssistantModal();
+    state.pendingTransform = null;
+    showToast(`Успешно применено ${count} измененных полей к карточке!`, 'success', 5000);
+    appLog(`ИИ-Ассистент: применены изменения к ${count} полям карточки.`, 'success');
+  });
+
+  // Log Console Drawer Controls
+  if (elements.btnToggleConsole) {
+    elements.btnToggleConsole.addEventListener('click', () => {
+      const isShown = elements.logConsoleDrawer.style.display === 'flex';
+      elements.logConsoleDrawer.style.display = isShown ? 'none' : 'flex';
+    });
+  }
+
+  if (elements.btnCloseLogConsole) {
+    elements.btnCloseLogConsole.addEventListener('click', () => {
+      elements.logConsoleDrawer.style.display = 'none';
+    });
+  }
+
+  if (elements.btnClearLogs) {
+    elements.btnClearLogs.addEventListener('click', () => {
+      if (elements.logConsoleBody) elements.logConsoleBody.innerHTML = '';
+      logBuffer.length = 0;
+      logCounter = 0;
+      if (elements.logCountBadge) elements.logCountBadge.textContent = '0';
+      showToast('Консоль логов очищена.', 'info', 1500);
+    });
+  }
+
+  if (elements.btnCopyLogs) {
+    elements.btnCopyLogs.addEventListener('click', () => {
+      if (logBuffer.length === 0) {
+        showToast('Консоль пуста.', 'warning');
+        return;
+      }
+      navigator.clipboard.writeText(logBuffer.join('\n'));
+      showToast(`Скопировано ${logBuffer.length} строк логов!`, 'success', 2000);
+    });
+  }
 }
 
 // Bootstrapping
 window.addEventListener('DOMContentLoaded', () => {
   initEvents();
   updateSettingsModalUI();
+  appLog('Приложение AI Card Translator инициализировано. Консоль логов готова.');
 });

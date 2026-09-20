@@ -28,6 +28,9 @@
       <div class="status-pill">
         Язык: <strong>RU (Русский)</strong>
       </div>
+      <button class="btn btn-secondary btn-sm" id="btn-toggle-console" title="Открыть/закрыть встроенную консоль логов">
+        📜 Логи <span class="badge" id="log-count-badge" style="font-size: 0.65rem; padding: 1px 5px; margin-left: 2px;">0</span>
+      </button>
       <button class="btn btn-secondary btn-sm" id="btn-open-settings" title="Настройки API и моделей">
         ⚙️ Настройки API
       </button>
@@ -80,6 +83,9 @@
           <!-- Batch Translation Actions -->
           <button class="btn btn-accent" id="btn-translate-all" title="Перевести всю карточку в 2 шага (анализ контекста + XML-перевод)">
             ⚡ Перевести всю карточку
+          </button>
+          <button class="btn btn-primary" id="btn-open-assistant" title="Спросить ИИ о персонаже или дать задачу изменить карточку">
+            🪄 ИИ-Ассистент
           </button>
           <button class="btn btn-danger" id="btn-cancel-translation" style="display: none;">
             ⏹️ Остановить
@@ -273,7 +279,7 @@
             </button>
           </div>
           <textarea id="setting-system-prompt" class="form-control" rows="6" style="font-size: 0.8rem; line-height: 1.4;"></textarea>
-          <div class="form-hint">Инструкция гарантирует сохранение {{char}}, {{user}}, <START>, звездочек действий и живой русский язык.</div>
+          <div class="form-hint">Инструкция гарантирует сохранение {{char}}, {{user}}, &lt;START&gt;, замену JanitorAI {{sub}}/{{obj}} на {{user}}, звездочек действий и живой русский язык.</div>
         </div>
 
         <!-- Temperature -->
@@ -284,7 +290,8 @@
           </div>
           <div class="form-group">
             <label for="setting-max-tokens">Max Tokens на ответ:</label>
-            <input type="number" id="setting-max-tokens" class="form-control" value="4096">
+            <input type="number" id="setting-max-tokens" class="form-control" value="8192" min="1024" max="65536" step="512">
+            <div class="form-hint">Лимит токенов на ответ (рекомендуется 8192 или 16384 для современных LLM).</div>
           </div>
         </div>
 
@@ -296,11 +303,147 @@
     </div>
   </div>
 
+  <!-- AI Assistant Modal (Ask / Transform) -->
+  <div class="modal-backdrop" id="assistant-modal">
+    <div class="modal-box modal-lg">
+      <div class="modal-header">
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <span style="font-size: 1.4rem;">🪄</span>
+          <div>
+            <h3 style="margin-bottom: 2px;">ИИ-Ассистент карточки</h3>
+            <p style="font-size: 0.75rem; color: var(--text-muted); margin: 0;">Анализ, объяснение и образная адаптация персонажа по вашей задаче</p>
+          </div>
+        </div>
+        <button class="btn-icon" id="btn-close-assistant" title="Закрыть">&times;</button>
+      </div>
+
+      <!-- Tab Navigation -->
+      <div class="modal-tabs">
+        <button class="modal-tab active" id="tab-btn-ask" data-tab="ask">
+          ❓ Вопрос / Анализ карточки
+        </button>
+        <button class="modal-tab" id="tab-btn-transform" data-tab="transform">
+          ✨ Изменить персонажа (Задача)
+        </button>
+      </div>
+
+      <div class="modal-body">
+        <!-- Tab 1: Ask / Explain -->
+        <div class="tab-pane active" id="pane-ask">
+          <div class="assistant-section-hint">
+            Задайте любой вопрос об ИИ-персонаже. Модель проанализирует карточку и подробно объяснит суть роли, психологию, лор или скрытые директивы.
+          </div>
+
+          <div class="prompt-chips-label">Быстрые вопросы в 1 клик:</div>
+          <div class="prompt-chips-container" id="ask-chips-container">
+            <button type="button" class="prompt-chip" data-ask="В чём главная концепция, предыстория и тайна этого персонажа?">🔍 В чём концепция и тайна?</button>
+            <button type="button" class="prompt-chip" data-ask="Как этот персонаж должен вести себя в диалоге с {{user}}? Какие у него манеры и триггеры?">🎭 Как вести диалог?</button>
+            <button type="button" class="prompt-chip" data-ask="Разбери первое сообщение: каков здесь сюжетный конфликт, обстановка и что ожидается от {{user}}?">📜 Разбор первого сообщения</button>
+            <button type="button" class="prompt-chip" data-ask="Объясни скрытые инструкции (системный промпт, post-history) и записи лорбука. Как они влияют на ответы?">⚙️ Скрытые инструкции и лорбук</button>
+          </div>
+
+          <div class="form-group" style="margin-top: 14px;">
+            <label for="assistant-question-input">Ваш вопрос к ИИ:</label>
+            <textarea id="assistant-question-input" class="form-control" rows="3" placeholder="Например: Почему персонаж так настороженно относится к игроку и как это обыграть?"></textarea>
+          </div>
+
+          <div style="display: flex; justify-content: flex-end; gap: 8px;">
+            <button class="btn btn-primary" id="btn-send-question">
+              🚀 Спросить ИИ
+            </button>
+          </div>
+
+          <!-- Question Result Box -->
+          <div id="assistant-ask-result-box" style="display: none; margin-top: 16px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+              <strong style="color: #a5b4fc; font-size: 0.85rem;">Ответ ИИ:</strong>
+              <button class="btn btn-secondary btn-sm" id="btn-copy-ask-result" title="Скопировать ответ">📋 Копировать ответ</button>
+            </div>
+            <div class="assistant-answer-view" id="assistant-ask-result-text"></div>
+          </div>
+        </div>
+
+        <!-- Tab 2: Transform / Modify -->
+        <div class="tab-pane" id="pane-transform" style="display: none;">
+          <div class="assistant-section-hint">
+            Опишите своими словами, что нужно образно изменить в персонаже (характер, манеру речи, сеттинг, конфликт или предысторию). ИИ адаптирует карточку с сохранением всех макросов (<code>{{char}}</code>, <code>{{user}}</code>, <code>&lt;START&gt;</code>).
+          </div>
+
+          <div class="prompt-chips-label">Идеи трансформации в 1 клик:</div>
+          <div class="prompt-chips-container" id="transform-chips-container">
+            <button type="button" class="prompt-chip" data-transform="Сделай персонажа дерзким, язвительным и саркастичным, с острым черным юмором, но скрытой симпатией к {{user}}.">😼 Дерзкий и саркастичный</button>
+            <button type="button" class="prompt-chip" data-transform="Сделай персонажа очень заботливым, мягким, теплым и нежным по отношению к {{user}}.">💖 Заботливый и мягкий</button>
+            <button type="button" class="prompt-chip" data-transform="Сделай персонажа холодным, сдержанным и гордым аристократом. Обращение к {{user}} строго на «Вы».">❄️ Холодный аристократ (на «Вы»)</button>
+            <button type="button" class="prompt-chip" data-transform="Перенеси сеттинг карточки в неоновый киберпанк: измени технологии, окружение и первое сообщение.">🏙️ Сеттинг: Киберпанк</button>
+            <button type="button" class="prompt-chip" data-transform="Перенеси сеттинг карточки в темное мрачное фэнтези (Dark Fantasy) с атмосферой древней магии.">🏰 Сеттинг: Dark Fantasy</button>
+            <button type="button" class="prompt-chip" data-transform="Усиль эмоциональное напряжение, интригу и драму в первом сообщении и описании сценария.">💥 Усилить драму и конфликт</button>
+          </div>
+
+          <div class="form-group" style="margin-top: 14px;">
+            <label for="assistant-transform-input">Творческая задача / Инструкция по изменению:</label>
+            <textarea id="assistant-transform-input" class="form-control" rows="3" placeholder="Опишите желаемые изменения..."></textarea>
+          </div>
+
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+            <div style="font-size: 0.8rem; color: var(--text-muted);">
+              Источник данных:
+              <select id="assistant-source-select" class="form-control" style="display: inline-block; width: auto; padding: 3px 8px; font-size: 0.8rem;">
+                <option value="translated" selected>Текущая карточка перевода (Справа)</option>
+                <option value="original">Оригинальная карточка (Слева)</option>
+              </select>
+            </div>
+            <button class="btn btn-accent" id="btn-execute-transform">
+              ⚡ Выполнить трансформацию
+            </button>
+          </div>
+
+          <!-- Transform Result Preview Box -->
+          <div id="assistant-transform-result-box" style="display: none; margin-top: 16px;">
+            <div class="transform-summary-card">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                <strong style="color: #34d399; font-size: 0.9rem;">✨ Сводка изменений:</strong>
+                <button class="btn btn-success btn-sm" id="btn-apply-transform">
+                  ✅ Применить к карточке
+                </button>
+              </div>
+              <div id="transform-summary-text" style="font-size: 0.85rem; line-height: 1.5; color: var(--text-main); margin-bottom: 12px; white-space: pre-wrap;"></div>
+              <div id="transform-diff-list" class="transform-diff-list"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-footer" style="justify-content: space-between;">
+        <span id="assistant-status-text" style="font-size: 0.8rem; color: var(--text-dim);">Готов к работе</span>
+        <button class="btn btn-secondary" id="btn-dismiss-assistant">Закрыть</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Drag and Drop Global Overlay -->
   <div id="drag-overlay">
     <div style="font-size: 64px; margin-bottom: 16px;">📥</div>
     <h2 style="font-size: 1.8rem; font-weight: 700;">Отпустите файл здесь</h2>
     <p style="color: var(--text-muted);">PNG карточка или JSON файл</p>
+  </div>
+
+  <!-- In-App Docked Log Console Drawer -->
+  <div class="log-console-drawer" id="log-console-drawer" style="display: none;">
+    <div class="log-console-header">
+      <div class="log-console-title">
+        <span>📜</span>
+        <strong>Консоль событий и логов</strong>
+        <span class="badge" id="log-console-status">Онлайн</span>
+      </div>
+      <div style="display: flex; gap: 8px; align-items: center;">
+        <button class="btn btn-secondary btn-sm" id="btn-copy-logs" title="Скопировать все логи">📋 Копировать</button>
+        <button class="btn btn-secondary btn-sm" id="btn-clear-logs" title="Очистить консоль">🧹 Очистить</button>
+        <button class="btn-icon" id="btn-close-log-console" title="Свернуть консоль">&times;</button>
+      </div>
+    </div>
+    <div class="log-console-body" id="log-console-body">
+      <!-- Log rows injected dynamically -->
+    </div>
   </div>
 
   <!-- Toast Notification Container -->

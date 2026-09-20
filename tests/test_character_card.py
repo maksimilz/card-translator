@@ -284,12 +284,12 @@ class TestCharacterCard(unittest.TestCase):
         self.assertNotIn('chain of thought', cleaned)
         self.assertEqual(cleaned, '<first_mes>*\u041e\u043d\u0430 \u0443\u043b\u044b\u0431\u043d\u0443\u043b\u0430\u0441\u044c*</first_mes>')
 
-        # Repair macros: {char}, {user}, {{персонаж}}, {{пользователя}}, <start>, {{{char}}}
-        text = "Hello {char}, I am {user}. {{{char}}} talks to {{\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044f}} at <start>."
+        # Repair macros: {char}, {user}, {{персонаж}}, {{пользователя}}, <start>, {{{char}}}, {{sub}}, {{obj}}
+        text = "Hello {char}, I am {user}. {{{char}}} talks to {{\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044f}} at <start>. {{sub}} meets {{obj}}."
         repaired = re.sub(r'\{{1,3}\s*(?:char|' + '\u043f\u0435\u0440\u0441\u043e\u043d\u0430\u0436[\u0430-\u044f\u0451]*|\u0431\u043e\u0442[\u0430-\u044f\u0451]*|\u043f\u0435\u0440\u0441[\u0430-\u044f\u0451]*' + r')\s*\}{1,3}', '{{char}}', text, flags=re.IGNORECASE)
-        repaired = re.sub(r'\{{1,3}\s*(?:user|' + '\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b[\u0430-\u044f\u0451]*|\u044e\u0437\u0435\u0440[\u0430-\u044f\u0451]*|\u0438\u0433\u0440\u043e\u043a[\u0430-\u044f\u0451]*' + r')\s*\}{1,3}', '{{user}}', repaired, flags=re.IGNORECASE)
+        repaired = re.sub(r'\{{1,3}\s*(?:user|sub|obj|' + '\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b[\u0430-\u044f\u0451]*|\u044e\u0437\u0435\u0440[\u0430-\u044f\u0451]*|\u0438\u0433\u0440\u043e\u043a[\u0430-\u044f\u0451]*' + r')\s*\}{1,3}', '{{user}}', repaired, flags=re.IGNORECASE)
         repaired = re.sub(r'(?:\[\s*START\s*\]|<\s*start\s*>|\[' + '\u0441\u0442\u0430\u0440\u0442' + r'\]|<' + '\u0441\u0442\u0430\u0440\u0442' + r'>)', '<START>', repaired, flags=re.IGNORECASE)
-        self.assertEqual(repaired, "Hello {{char}}, I am {{user}}. {{char}} talks to {{user}} at <START>.")
+        self.assertEqual(repaired, "Hello {{char}}, I am {{user}}. {{char}} talks to {{user}} at <START>. {{user}} meets {{user}}.")
 
     def test_balance_asterisks_with_lists_and_breaks(self):
         import re
@@ -517,6 +517,152 @@ class TestCharacterCard(unittest.TestCase):
                 i += 1
 
             self.assertEqual(len(stack), 0, f"Unclosed brackets at EOF in {os.path.basename(js_file)}: {[s[0] for s in stack]}")
+
+    def test_lorebook_chunking_division(self):
+        # Verify chunking of large lorebooks into batches of 4
+        entries = [{"id": i, "comment": f"Entry {i}"} for i in range(11)]
+        chunk_size = 4
+        chunks = []
+        for i in range(0, len(entries), chunk_size):
+            chunks.append(entries[i:i + chunk_size])
+
+        self.assertEqual(len(chunks), 3)
+        self.assertEqual(len(chunks[0]), 4)
+        self.assertEqual(len(chunks[1]), 4)
+        self.assertEqual(len(chunks[2]), 3)
+        flattened = [item["id"] for chunk in chunks for item in chunk]
+        self.assertEqual(flattened, list(range(11)))
+
+    def test_transformation_xml_extraction(self):
+        import re
+        transform_response = """
+<personality>Дерзкая, язвительная, с острым сарказмом и тайной заботой о {{user}}.</personality>
+<first_mes>*Она усмехнулась, скрестив руки.* «Ты снова здесь, {{user}}? Надеялся на тёплый приём?»</first_mes>
+<changes_summary>
+- Изменен тон на дерзкий и саркастичный.
+- Добавлены язвительные реплики в первое сообщение.
+- Сохранены макросы {{char}} и {{user}}.
+</changes_summary>
+"""
+        raw_matches = re.findall(r'<([a-zA-Z0-9_-]+)(?:\s+[^>]*)?>([\s\S]*?)<\/\1>', transform_response, flags=re.IGNORECASE)
+        fields = {k.lower().replace('-', '_'): v.strip() for k, v in raw_matches}
+
+        self.assertIn('personality', fields)
+        self.assertIn('first_mes', fields)
+        self.assertIn('changes_summary', fields)
+        self.assertIn('{{user}}', fields['personality'])
+        self.assertIn('{{user}}', fields['first_mes'])
+        self.assertIn('Изменен тон', fields['changes_summary'])
+
+    def test_transformation_macro_preservation(self):
+        import re
+        # Model may produce localized macro or lowercase tags
+        raw_text = "*Она посмотрела на {{пользователя}}.* {char} подошел к <start>."
+        repaired = re.sub(r'\{{1,3}\s*(?:char|персонаж[а-яё]*|бот[а-яё]*|перс[а-яё]*)\s*\}{1,3}', '{{char}}', raw_text, flags=re.IGNORECASE)
+        repaired = re.sub(r'\{{1,3}\s*(?:user|пользовател[а-яё]*|юзер[а-яё]*|игрок[а-яё]*)\s*\}{1,3}', '{{user}}', repaired, flags=re.IGNORECASE)
+        repaired = re.sub(r'(?:\[\s*START\s*\]|<\s*start\s*>|\[старт\]|<старт>)', '<START>', repaired, flags=re.IGNORECASE)
+
+        self.assertEqual(repaired, "*Она посмотрела на {{user}}.* {{char}} подошел к <START>.")
+
+    def test_logging_system_components(self):
+        # 1. Verify run.py contains logging logic
+        run_py_path = os.path.join(os.path.dirname(__file__), '..', 'run.py')
+        with open(run_py_path, 'r', encoding='utf-8') as f:
+            run_py_code = f.read()
+        self.assertIn('[LLM Прокси]', run_py_code)
+        self.assertIn('[HTTP]', run_py_code)
+
+        # 2. Verify index.html contains console drawer and controls
+        html_path = os.path.join(os.path.dirname(__file__), '..', 'index.html')
+        with open(html_path, 'r', encoding='utf-8') as f:
+            html_code = f.read()
+        self.assertIn('id="btn-toggle-console"', html_code)
+        self.assertIn('id="log-console-drawer"', html_code)
+        self.assertIn('id="log-console-body"', html_code)
+        self.assertIn('id="btn-clear-logs"', html_code)
+        self.assertIn('id="btn-copy-logs"', html_code)
+
+        # 3. Verify js/app.js contains appLog implementation
+        app_js_path = os.path.join(os.path.dirname(__file__), '..', 'js', 'app.js')
+        with open(app_js_path, 'r', encoding='utf-8') as f:
+            app_js_code = f.read()
+        self.assertIn('function appLog(', app_js_code)
+        self.assertIn('btnToggleConsole', app_js_code)
+        self.assertIn('logConsoleDrawer', app_js_code)
+
+    def test_janitor_sub_obj_macro_normalization(self):
+        import re
+        import subprocess
+
+        # 1. Regex unit test covering JanitorAI sub/obj variations
+        sub_obj_pattern = r'\{{1,3}\s*(?:sub|obj)\s*\}{1,3}'
+        test_inputs = [
+            ("{{sub}} looked around", "{{user}} looked around"),
+            ("He talked to {{obj}}.", "He talked to {{user}}."),
+            ("{sub} and {obj}", "{{user}} and {{user}}"),
+            ("{{{sub}}} and {{{obj}}}", "{{user}} and {{user}}"),
+            ("{{ sub }} and {{  obj  }}", "{{user}} and {{user}}"),
+            ("{{SUB}} and {{OBJ}}", "{{user}} and {{user}}"),
+            ("{{Sub}} and {{Obj}}", "{{user}} and {{user}}"),
+            ("The subject was objective", "The subject was objective"),  # word boundary check
+        ]
+        for src, expected in test_inputs:
+            actual = re.sub(sub_obj_pattern, '{{user}}', src, flags=re.IGNORECASE)
+            self.assertEqual(actual, expected)
+
+        # 2. Integration test via Node.js importing actual card-parser.js and translator.js
+        node_script = """
+import { normalizeCard, replaceSubObj, hasSubObjMacros } from './js/card-parser.js';
+import { repairMacrosAndTags } from './js/translator.js';
+import assert from 'assert';
+
+assert.strictEqual(replaceSubObj('{{sub}} meets {{obj}}'), '{{user}} meets {{user}}');
+assert.strictEqual(replaceSubObj('{sub} and {obj}'), '{{user}} and {{user}}');
+assert.strictEqual(replaceSubObj('{{{sub}}} and {{{obj}}}'), '{{user}} and {{user}}');
+assert.strictEqual(replaceSubObj('{{ SUB }} and {{ OBJ }}'), '{{user}} and {{user}}');
+assert.strictEqual(replaceSubObj('A subject of discussion'), 'A subject of discussion');
+
+assert.strictEqual(hasSubObjMacros('Text with {{sub}}'), true);
+assert.strictEqual(hasSubObjMacros('Text with {{obj}}'), true);
+assert.strictEqual(hasSubObjMacros('Text without macros'), false);
+
+const card = {
+    spec: 'chara_card_v2',
+    spec_version: '2.0',
+    data: {
+        name: 'Janitor Bot',
+        description: '{{sub}} is a traveler who meets {{obj}}.',
+        personality: 'Friendly to {{obj}}.',
+        scenario: '{{sub}} is in a dungeon.',
+        first_mes: '*{{char}} smiles at {{sub}} and hugs {{obj}}.*',
+        alternate_greetings: ['*{{char}} waves at {{sub}}.*'],
+        character_book: {
+            name: 'Book about {{obj}}',
+            entries: [
+                { keys: ['{{sub}}'], content: 'Lore about {{obj}}', comment: '{{sub}} entry' }
+            ]
+        }
+    }
+};
+
+const normalized = normalizeCard(card);
+assert.strictEqual(normalized.data.description, '{{user}} is a traveler who meets {{user}}.');
+assert.strictEqual(normalized.data.personality, 'Friendly to {{user}}.');
+assert.strictEqual(normalized.data.scenario, '{{user}} is in a dungeon.');
+assert.strictEqual(normalized.data.first_mes, '*{{char}} smiles at {{user}} and hugs {{user}}.*');
+assert.strictEqual(normalized.data.alternate_greetings[0], '*{{char}} waves at {{user}}.*');
+assert.strictEqual(normalized.data.character_book.name, 'Book about {{user}}');
+assert.strictEqual(normalized.data.character_book.entries[0].keys[0], '{{user}}');
+assert.strictEqual(normalized.data.character_book.entries[0].content, 'Lore about {{user}}');
+assert.strictEqual(normalized.data.character_book.entries[0].comment, '{{user}} entry');
+
+assert.strictEqual(repairMacrosAndTags('{{sub}} talks to {{obj}}'), '{{user}} talks to {{user}}');
+console.log('JS_SUB_OBJ_TESTS_PASS');
+"""
+        cwd = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+        res = subprocess.run(['node', '--input-type=module', '-e', node_script], cwd=cwd, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, f"Node script failed: {res.stderr}")
+        self.assertIn('JS_SUB_OBJ_TESTS_PASS', res.stdout)
 
 if __name__ == '__main__':
     unittest.main()

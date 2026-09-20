@@ -21,6 +21,24 @@ export const METADATA_FIELDS = [
 ];
 
 /**
+ * Normalizes JanitorAI {{sub}} and {{obj}} macros into {{user}}.
+ * Supports variations: {{sub}}, {sub}, {{{sub}}}, {{obj}}, {obj}, {{{obj}}}, with arbitrary spacing and case-insensitivity.
+ */
+export function replaceSubObj(text) {
+  if (!text || typeof text !== 'string') return text || '';
+  return text.replace(/\{{1,3}\s*(?:sub|obj)\s*\}{1,3}/gi, '{{user}}');
+}
+
+/**
+ * Checks if a card or text contains {{sub}} or {{obj}} macros
+ */
+export function hasSubObjMacros(obj) {
+  if (!obj) return false;
+  const str = typeof obj === 'string' ? obj : JSON.stringify(obj);
+  return /\{{1,3}\s*(?:sub|obj)\s*\}{1,3}/i.test(str);
+}
+
+/**
  * Normalizes input JSON into standard Character Card V2 structure
  */
 export function normalizeCard(json) {
@@ -46,21 +64,21 @@ export function normalizeCard(json) {
   }
 
   const normalizedData = {
-    name: String(data.name || '').trim(),
-    description: String(data.description || ''),
-    personality: String(data.personality || ''),
-    scenario: String(data.scenario || ''),
-    first_mes: String(data.first_mes || ''),
-    mes_example: String(data.mes_example || ''),
-    creator_notes: String(data.creator_notes || ''),
-    system_prompt: String(data.system_prompt || ''),
-    post_history_instructions: String(data.post_history_instructions || ''),
+    name: replaceSubObj(String(data.name || '')).trim(),
+    description: replaceSubObj(String(data.description || '')),
+    personality: replaceSubObj(String(data.personality || '')),
+    scenario: replaceSubObj(String(data.scenario || '')),
+    first_mes: replaceSubObj(String(data.first_mes || data.greeting || '')),
+    mes_example: replaceSubObj(String(data.mes_example || '')),
+    creator_notes: replaceSubObj(String(data.creator_notes || '')),
+    system_prompt: replaceSubObj(String(data.system_prompt || '')),
+    post_history_instructions: replaceSubObj(String(data.post_history_instructions || '')),
     alternate_greetings: Array.isArray(data.alternate_greetings)
-      ? data.alternate_greetings.map(g => String(g))
+      ? data.alternate_greetings.map(g => replaceSubObj(String(g)))
       : [],
     tags: Array.isArray(data.tags)
-      ? data.tags.map(t => String(t))
-      : (typeof data.tags === 'string' && data.tags ? data.tags.split(',').map(t => t.trim()) : []),
+      ? data.tags.map(t => replaceSubObj(String(t)))
+      : (typeof data.tags === 'string' && data.tags ? data.tags.split(',').map(t => replaceSubObj(t.trim())) : []),
     creator: String(data.creator || ''),
     character_version: String(data.character_version || '1.0'),
     extensions: (data.extensions && typeof data.extensions === 'object') ? data.extensions : {}
@@ -68,7 +86,21 @@ export function normalizeCard(json) {
 
   const charBook = data.character_book || json.character_book || (data.extensions && data.extensions.character_book);
   if (charBook && typeof charBook === 'object') {
-    normalizedData.character_book = JSON.parse(JSON.stringify(charBook));
+    const clonedBook = JSON.parse(JSON.stringify(charBook));
+    if (typeof clonedBook.name === 'string') clonedBook.name = replaceSubObj(clonedBook.name);
+    if (typeof clonedBook.description === 'string') clonedBook.description = replaceSubObj(clonedBook.description);
+    if (Array.isArray(clonedBook.entries)) {
+      clonedBook.entries.forEach(entry => {
+        if (!entry || typeof entry !== 'object') return;
+        if (typeof entry.content === 'string') entry.content = replaceSubObj(entry.content);
+        if (typeof entry.comment === 'string') entry.comment = replaceSubObj(entry.comment);
+        if (Array.isArray(entry.keys)) entry.keys = entry.keys.map(k => replaceSubObj(String(k)));
+        else if (typeof entry.keys === 'string') entry.keys = replaceSubObj(entry.keys);
+        if (Array.isArray(entry.secondary_keys)) entry.secondary_keys = entry.secondary_keys.map(k => replaceSubObj(String(k)));
+        else if (typeof entry.secondary_keys === 'string') entry.secondary_keys = replaceSubObj(entry.secondary_keys);
+      });
+    }
+    normalizedData.character_book = clonedBook;
   }
 
   return {

@@ -132,8 +132,22 @@ class ProxyAndStaticServer(SimpleHTTPRequestHandler):
 
         has_key = bool(forward_headers.get('x-api-key') or forward_headers.get('Authorization'))
         target_short = target_url.split('?')[0]
-        print(f"[Proxy] {self.command} {target_short} | Auth: {'✓ (Ключ передан)' if has_key else '✗ (КЛЮЧ ОТСУТСТВУЕТ!)'}")
 
+        # Extract model from JSON body if present
+        model_name = ""
+        if body:
+            try:
+                body_json = json.loads(body.decode('utf-8'))
+                model_name = body_json.get('model', '')
+            except Exception:
+                pass
+
+        now = time.strftime('%H:%M:%S')
+        model_tag = f" | Модель: {model_name}" if model_name else ""
+        auth_tag = "✓ (Ключ передан)" if has_key else "✗ (КЛЮЧ ОТСУТСТВУЕТ!)"
+        print(f"[{now}] [LLM Прокси] {self.command} {target_short}{model_tag} | Auth: {auth_tag}")
+
+        t0 = time.time()
         try:
             req = urllib.request.Request(target_url, data=body, headers=forward_headers, method=self.command)
             with urllib.request.urlopen(req, context=SSL_CTX, timeout=180) as resp:
@@ -149,12 +163,16 @@ class ProxyAndStaticServer(SimpleHTTPRequestHandler):
                     except Exception:
                         pass
 
-                print(f"[Proxy] -> Ответ от сервера: HTTP {status}")
+                elapsed = round(time.time() - t0, 2)
+                now_resp = time.strftime('%H:%M:%S')
+                print(f"[{now_resp}] [LLM Прокси] -> Ответ получен за {elapsed}с: HTTP {status} ({len(resp_data)} байт)")
                 self.send_response(status)
                 self.send_header('Content-Type', 'application/json; charset=utf-8')
                 self.end_headers()
                 self.wfile.write(resp_data)
         except urllib.error.HTTPError as e:
+            elapsed = round(time.time() - t0, 2)
+            now_err = time.strftime('%H:%M:%S')
             err_data = e.read()
             enc = e.headers.get('Content-Encoding', '').lower()
             if enc == 'gzip' or err_data[:2] == b'\x1f\x8b':
@@ -163,7 +181,7 @@ class ProxyAndStaticServer(SimpleHTTPRequestHandler):
                 except Exception:
                     pass
 
-            print(f"[Proxy] -> Сервер вернул HTTP {e.code}")
+            print(f"[{now_err}] [LLM Прокси] -> Ошибка API за {elapsed}с: HTTP {e.code}")
 
             # Friendly message for 403 Forbidden with HTML Cloudflare/Vercel page
             if e.code == 403 and (b'<!DOCTYPE' in err_data or b'<html' in err_data):
@@ -197,8 +215,10 @@ class ProxyAndStaticServer(SimpleHTTPRequestHandler):
             self.wfile.write(err_msg.encode('utf-8'))
 
     def log_message(self, format, *args):
-        # Keep console clean
-        pass
+        if not self.path.startswith('/api-proxy'):
+            now = time.strftime('%H:%M:%S')
+            msg = format % args
+            print(f"[{now}] [HTTP] {msg}")
 
 def find_free_port(start_port=8000, max_attempts=20):
     for p in range(start_port, start_port + max_attempts):

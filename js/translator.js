@@ -13,6 +13,7 @@ export const DEFAULT_PROMPT_RU = `Ты — профессиональный ли
 1. СОХРАНЯЙ ВСЕ МАКРОСЫ И ПЕРЕМЕННЫЕ БЕЗ ИЗМЕНЕНИЙ:
    - {{char}}, {{user}}, {{original}}, <START>, <USER>, <BOT>, XML-теги вроде <guidelines>, <personality> НЕЛЬЗЯ переводить или менять регистр!
    - Не заменяй {{char}} на имя персонажа! Оставляй именно {{char}} и {{user}}!
+   - Макросы {{sub}} и {{obj}} (из JanitorAI) заменяй на {{user}}!
 2. СОХРАНЯЙ СТРУКТУРУ И ФОРМАТИРОВАНИЕ:
    - Действия в звездочках *действие* должны оставаться в звездочках *действие*.
    - Прямая речь в кавычках должна оставаться в кавычках.
@@ -135,7 +136,7 @@ export function loadSettings() {
     targetLang: 'ru',
     systemPrompt: DEFAULT_PROMPT_RU,
     temperature: 0.3,
-    maxTokens: 4096
+    maxTokens: 8192
   };
 
   try {
@@ -286,8 +287,8 @@ export function repairMacrosAndTags(text) {
 
   // Normalize char macros: {{char}}, {char}, {{{char}}}, {{персонаж}}, {{персонажа}}, {{бот}}, {{перс}}, etc.
   res = res.replace(/\{{1,3}\s*(?:char|персонаж[а-яё]*|бот[а-яё]*|перс[а-яё]*)\s*\}{1,3}/gi, '{{char}}');
-  // Normalize user macros: {{user}}, {user}, {{{user}}}, {{пользователь}}, {{пользователя}}, {{юзер}}, {{игрок}}, etc.
-  res = res.replace(/\{{1,3}\s*(?:user|пользовател[а-яё]*|юзер[а-яё]*|игрок[а-яё]*)\s*\}{1,3}/gi, '{{user}}');
+  // Normalize user macros: {{user}}, {user}, {{{user}}}, {{sub}}, {{obj}}, {{пользователь}}, {{пользователя}}, {{юзер}}, {{игрок}}, etc.
+  res = res.replace(/\{{1,3}\s*(?:user|sub|obj|пользовател[а-яё]*|юзер[а-яё]*|игрок[а-яё]*)\s*\}{1,3}/gi, '{{user}}');
   // Normalize original macro: {{original}}
   res = res.replace(/\{{1,3}\s*original\s*\}{1,3}/gi, '{{original}}');
 
@@ -581,7 +582,8 @@ export async function translateFullCard({
   cardData,
   passport = null,
   settings,
-  signal = null
+  signal = null,
+  onProgress = null
 }) {
   if ((settings.provider === 'nanogpt' || settings.provider === 'openrouter') && (!settings.apiKey || !settings.apiKey.trim())) {
     throw new Error('API-ключ не задан! Откройте «⚙️ Настройки API» и вставьте ваш ключ от ' + (settings.provider === 'nanogpt' ? 'Nano-GPT' : 'OpenRouter') + '.');
@@ -604,56 +606,6 @@ export async function translateFullCard({
   if (settings.provider === 'openrouter') {
     headers['HTTP-Referer'] = window.location.origin || 'http://localhost';
     headers['X-Title'] = 'AI Character Card Translator';
-  }
-
-  // Format fields to translate into XML tags
-  const xmlPayloadParts = [];
-  const standardKeys = [
-    'name', 'first_mes', 'description', 'personality', 'scenario',
-    'mes_example', 'creator_notes', 'system_prompt', 'post_history_instructions'
-  ];
-
-  for (const k of standardKeys) {
-    if (cardData[k] && String(cardData[k]).trim()) {
-      xmlPayloadParts.push(`<${k}>\n${cardData[k]}\n</${k}>`);
-    }
-  }
-
-  if (Array.isArray(cardData.tags) && cardData.tags.length > 0) {
-    xmlPayloadParts.push(`<tags>\n${cardData.tags.join(', ')}\n</tags>`);
-  }
-
-  if (Array.isArray(cardData.alternate_greetings)) {
-    cardData.alternate_greetings.forEach((g, idx) => {
-      if (g && String(g).trim()) {
-        xmlPayloadParts.push(`<greeting_${idx}>\n${g}\n</greeting_${idx}>`);
-      }
-    });
-  }
-
-  // Include lorebook name, description, and entries if present
-  if (cardData.character_book) {
-    if (cardData.character_book.name) {
-      xmlPayloadParts.push(`<lorebook_name>\n${cardData.character_book.name}\n</lorebook_name>`);
-    }
-    if (cardData.character_book.description) {
-      xmlPayloadParts.push(`<lorebook_description>\n${cardData.character_book.description}\n</lorebook_description>`);
-    }
-    if (Array.isArray(cardData.character_book.entries)) {
-      cardData.character_book.entries.forEach((entry, idx) => {
-        if (!entry) return;
-        if (entry.content) {
-          xmlPayloadParts.push(`<entry_${idx}_content>\n${entry.content}\n</entry_${idx}_content>`);
-        }
-        const keysVal = Array.isArray(entry.keys) ? entry.keys.join(', ') : (entry.keys || '');
-        if (keysVal.trim()) {
-          xmlPayloadParts.push(`<entry_${idx}_keys>\n${keysVal}\n</entry_${idx}_keys>`);
-        }
-        if (entry.comment) {
-          xmlPayloadParts.push(`<entry_${idx}_comment>\n${entry.comment}\n</entry_${idx}_comment>`);
-        }
-      });
-    }
   }
 
   // Format glossary for system prompt
@@ -686,6 +638,7 @@ ${glossaryText}
 2. МАКРОСЫ И РАЗДЕЛИТЕЛИ:
    - СТРОГО сохраняй без изменений: {{char}}, {{user}}, {{original}}, <START>.
    - НЕ заменяй {{char}} на имя персонажа! Оставляй именно {{char}} и {{user}}!
+   - Макросы {{sub}} и {{obj}} (из JanitorAI) заменяй на {{user}}!
 3. ФОРМАТИРОВАНИЕ ДЕЙСТВИЙ И РЕПЛИК:
    - Действия персонажа в звездочках *действие* должны оставаться в парных звездочках *действие*.
    - Прямая речь персонажей — в кавычках («...» или "...").
@@ -694,6 +647,59 @@ ${glossaryText}
    - Оберни перевод каждого поля в соответствующий XML-тег в точности как в запросе (например: <name>...</name>, <first_mes>...</first_mes>, <greeting_0>...</greeting_0>, <entry_0_content>...</entry_0_content>).
    - НЕ используй JSON! Выводи данные только внутри тегов.
    - НЕ добавляй никакого текста до первого тега или после последнего тега. Выводи ТОЛЬКО запрошенные XML-теги.`;
+
+  const standardKeys = [
+    'name', 'first_mes', 'description', 'personality', 'scenario',
+    'mes_example', 'creator_notes', 'system_prompt', 'post_history_instructions'
+  ];
+
+  const lorebookEntries = cardData.character_book?.entries;
+  const isLorebookLarge = Array.isArray(lorebookEntries) && lorebookEntries.length > 4;
+
+  // Format main fields into XML tags
+  const xmlPayloadParts = [];
+  for (const k of standardKeys) {
+    if (cardData[k] && String(cardData[k]).trim()) {
+      xmlPayloadParts.push(`<${k}>\n${cardData[k]}\n</${k}>`);
+    }
+  }
+
+  if (Array.isArray(cardData.tags) && cardData.tags.length > 0) {
+    xmlPayloadParts.push(`<tags>\n${cardData.tags.join(', ')}\n</tags>`);
+  }
+
+  if (Array.isArray(cardData.alternate_greetings)) {
+    cardData.alternate_greetings.forEach((g, idx) => {
+      if (g && String(g).trim()) {
+        xmlPayloadParts.push(`<greeting_${idx}>\n${g}\n</greeting_${idx}>`);
+      }
+    });
+  }
+
+  // Lorebook metadata and (if small) entries
+  if (cardData.character_book) {
+    if (cardData.character_book.name) {
+      xmlPayloadParts.push(`<lorebook_name>\n${cardData.character_book.name}\n</lorebook_name>`);
+    }
+    if (cardData.character_book.description) {
+      xmlPayloadParts.push(`<lorebook_description>\n${cardData.character_book.description}\n</lorebook_description>`);
+    }
+    if (!isLorebookLarge && Array.isArray(lorebookEntries)) {
+      lorebookEntries.forEach((entry, idx) => {
+        if (!entry) return;
+        if (entry.content) {
+          xmlPayloadParts.push(`<entry_${idx}_content>\n${entry.content}\n</entry_${idx}_content>`);
+        }
+        const keysVal = Array.isArray(entry.keys) ? entry.keys.join(', ') : (entry.keys || '');
+        if (keysVal.trim()) {
+          xmlPayloadParts.push(`<entry_${idx}_keys>\n${keysVal}\n</entry_${idx}_keys>`);
+        }
+        if (entry.comment) {
+          xmlPayloadParts.push(`<entry_${idx}_comment>\n${entry.comment}\n</entry_${idx}_comment>`);
+        }
+      });
+    }
+  }
 
   const userContent = `Переведи поля карточки на русский язык с соблюдением паспорта контекста. Верни результат в соответствующих XML-тегах:\n\n${xmlPayloadParts.join('\n\n')}`;
 
@@ -704,11 +710,15 @@ ${glossaryText}
       { role: 'user', content: userContent }
     ],
     temperature: parseFloat(settings.temperature) || 0.3,
-    max_tokens: parseInt(settings.maxTokens, 10) || 4096,
+    max_tokens: parseInt(settings.maxTokens, 10) || 8192,
     stream: false
   };
 
   try {
+    if (onProgress) {
+      onProgress({ percent: isLorebookLarge ? 55 : 80, message: 'Перевод основных полей карточки...' });
+    }
+
     const rawContent = await postChatCompletion({
       rawEndpoint,
       requestBody,
@@ -717,7 +727,6 @@ ${glossaryText}
       signal
     });
 
-    // Step 2.5: Client-side JS Guardian & Parser
     const xmlFields = parseXmlFields(rawContent);
     const result = {};
 
@@ -732,17 +741,14 @@ ${glossaryText}
       }
     }
 
-    // Fallback for character name if missing in XML response
     if (!result.name && passport?.character_name_ru) {
       result.name = passport.character_name_ru.trim();
     }
 
-    // Process tags
     if (xmlFields.tags) {
       result.tags = xmlFields.tags.split(/[\n,;]+/).map(t => t.trim()).filter(Boolean);
     }
 
-    // Process alternate greetings
     if (Array.isArray(cardData.alternate_greetings) && cardData.alternate_greetings.length > 0) {
       result.alternate_greetings = cardData.alternate_greetings.map((origG, idx) => {
         const transG = xmlFields[`greeting_${idx}`] || xmlFields[`greeting${idx}`];
@@ -750,51 +756,107 @@ ${glossaryText}
       });
     }
 
-    // Process lorebook entries with additive key expansion
+    // Helper to process a single lorebook entry with additive keys
+    function applyLorebookEntry(newBook, entry, idx, fields) {
+      const transContent = fields[`entry_${idx}_content`];
+      if (transContent) {
+        entry.content = repairMacrosAndTags(balanceAsterisks(transContent));
+      }
+
+      const transComment = fields[`entry_${idx}_comment`];
+      if (transComment) {
+        entry.comment = transComment.trim();
+      }
+
+      let origKeysArr = [];
+      if (Array.isArray(entry.keys)) {
+        origKeysArr = entry.keys;
+      } else if (typeof entry.keys === 'string') {
+        origKeysArr = entry.keys.split(/[\n,;]+/);
+      }
+      const keys_original = origKeysArr.map(k => String(k).trim()).filter(Boolean);
+
+      const transKeysRaw = fields[`entry_${idx}_keys`];
+      const keys_from_xml = transKeysRaw
+        ? transKeysRaw.split(/[\n,;]+/).map(k => k.trim()).filter(Boolean)
+        : [];
+
+      const keys_from_passport = keys_original.flatMap(k => {
+        const lower = k.toLowerCase();
+        const mapped = passport?.lorebook_keys?.[k] || passport?.lorebook_keys?.[lower];
+        return mapped ? String(mapped).split(/[\n,;]+/) : [];
+      }).map(k => k.trim()).filter(Boolean);
+
+      entry.keys = [...new Set([...keys_original, ...keys_from_xml, ...keys_from_passport])];
+    }
+
+    // Process lorebook
     if (cardData.character_book) {
       const newBook = JSON.parse(JSON.stringify(cardData.character_book));
-      if (xmlFields.lorebook_name) {
-        newBook.name = xmlFields.lorebook_name.trim();
-      }
-      if (xmlFields.lorebook_description) {
-        newBook.description = xmlFields.lorebook_description.trim();
-      }
+      if (xmlFields.lorebook_name) newBook.name = xmlFields.lorebook_name.trim();
+      if (xmlFields.lorebook_description) newBook.description = xmlFields.lorebook_description.trim();
 
-      if (Array.isArray(newBook.entries)) {
+      if (!isLorebookLarge && Array.isArray(newBook.entries)) {
         newBook.entries.forEach((entry, idx) => {
-          const transContent = xmlFields[`entry_${idx}_content`];
-          if (transContent) {
-            entry.content = repairMacrosAndTags(balanceAsterisks(transContent));
-          }
-
-          const transComment = xmlFields[`entry_${idx}_comment`];
-          if (transComment) {
-            entry.comment = transComment.trim();
-          }
-
-          // Safe additive key expansion
-          let origKeysArr = [];
-          if (Array.isArray(entry.keys)) {
-            origKeysArr = entry.keys;
-          } else if (typeof entry.keys === 'string') {
-            origKeysArr = entry.keys.split(/[\n,;]+/);
-          }
-          const keys_original = origKeysArr.map(k => String(k).trim()).filter(Boolean);
-
-          const transKeysRaw = xmlFields[`entry_${idx}_keys`];
-          const keys_from_xml = transKeysRaw
-            ? transKeysRaw.split(/[\n,;]+/).map(k => k.trim()).filter(Boolean)
-            : [];
-
-          const keys_from_passport = keys_original.flatMap(k => {
-            const lower = k.toLowerCase();
-            const mapped = passport?.lorebook_keys?.[k] || passport?.lorebook_keys?.[lower];
-            return mapped ? String(mapped).split(/[\n,;]+/) : [];
-          }).map(k => k.trim()).filter(Boolean);
-
-          entry.keys = [...new Set([...keys_original, ...keys_from_xml, ...keys_from_passport])];
+          applyLorebookEntry(newBook, entry, idx, xmlFields);
         });
+      } else if (isLorebookLarge && Array.isArray(newBook.entries)) {
+        // Chunked translation for large lorebooks (4-5 entries per chunk to avoid any token limit)
+        const CHUNK_SIZE = 4;
+        const totalEntries = newBook.entries.length;
+
+        for (let chunkStart = 0; chunkStart < totalEntries; chunkStart += CHUNK_SIZE) {
+          if (signal?.aborted) throw new Error('Перевод был отменен пользователем.');
+
+          const chunkEnd = Math.min(chunkStart + CHUNK_SIZE, totalEntries);
+          const currentChunkPercent = 55 + Math.round(((chunkStart + 1) / totalEntries) * 40);
+
+          if (onProgress) {
+            onProgress({
+              percent: currentChunkPercent,
+              message: `Перевод лорбука: записи ${chunkStart + 1}–${chunkEnd} из ${totalEntries}...`
+            });
+          }
+
+          const chunkXmlParts = [];
+          for (let i = chunkStart; i < chunkEnd; i++) {
+            const e = newBook.entries[i];
+            if (!e) continue;
+            if (e.content) chunkXmlParts.push(`<entry_${i}_content>\n${e.content}\n</entry_${i}_content>`);
+            const kVal = Array.isArray(e.keys) ? e.keys.join(', ') : (e.keys || '');
+            if (kVal.trim()) chunkXmlParts.push(`<entry_${i}_keys>\n${kVal}\n</entry_${i}_keys>`);
+            if (e.comment) chunkXmlParts.push(`<entry_${i}_comment>\n${e.comment}\n</entry_${i}_comment>`);
+          }
+
+          const chunkUserContent = `Переведи следующие записи лорбука на русский язык с соблюдением паспорта контекста. Верни результат в соответствующих XML-тегах:\n\n${chunkXmlParts.join('\n\n')}`;
+
+          const chunkRequestBody = {
+            model: settings.model || 'deepseek/deepseek-chat',
+            messages: [
+              { role: 'system', content: fullCardSystemPrompt },
+              { role: 'user', content: chunkUserContent }
+            ],
+            temperature: parseFloat(settings.temperature) || 0.3,
+            max_tokens: parseInt(settings.maxTokens, 10) || 8192,
+            stream: false
+          };
+
+          const chunkRaw = await postChatCompletion({
+            rawEndpoint,
+            requestBody: chunkRequestBody,
+            headers,
+            provider: settings.provider,
+            signal
+          });
+
+          const chunkXmlFields = parseXmlFields(chunkRaw);
+          for (let i = chunkStart; i < chunkEnd; i++) {
+            const e = newBook.entries[i];
+            if (e) applyLorebookEntry(newBook, e, i, chunkXmlFields);
+          }
+        }
       }
+
       result.character_book = newBook;
     }
 
@@ -808,6 +870,207 @@ ${glossaryText}
       msg = 'Сетевая ошибка при запросе к LLM. Убедитесь, что сервер запущен через start.bat или run.py.';
     }
     throw new Error(msg);
+  }
+}
+
+/**
+ * Asks AI a question about the character card or requests an explanation/analysis.
+ */
+export async function askCharacterAI({
+  cardData,
+  question,
+  settings,
+  signal = null
+}) {
+  if (!question || !question.trim()) {
+    throw new Error('Вопрос не может быть пустым.');
+  }
+
+  if ((settings.provider === 'nanogpt' || settings.provider === 'openrouter') && (!settings.apiKey || !settings.apiKey.trim())) {
+    throw new Error('API-ключ не задан! Откройте «⚙️ Настройки API» и вставьте ваш ключ от ' + (settings.provider === 'nanogpt' ? 'Nano-GPT' : 'OpenRouter') + '.');
+  }
+
+  const cleanBaseUrl = settings.baseUrl.replace(/\/+$/, '');
+  const rawEndpoint = `${cleanBaseUrl}/chat/completions`;
+
+  const headers = {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json'
+  };
+
+  if (settings.apiKey) {
+    const trimmedKey = settings.apiKey.trim();
+    headers['Authorization'] = `Bearer ${trimmedKey}`;
+    headers['x-api-key'] = trimmedKey;
+  }
+
+  if (settings.provider === 'openrouter') {
+    headers['HTTP-Referer'] = window.location.origin || 'http://localhost';
+    headers['X-Title'] = 'AI Character Card Translator';
+  }
+
+  const cardSummaryParts = [];
+  if (cardData.name) cardSummaryParts.push(`Имя персонажа: ${cardData.name}`);
+  if (cardData.description) cardSummaryParts.push(`Описание:\n${cardData.description}`);
+  if (cardData.personality) cardSummaryParts.push(`Личность:\n${cardData.personality}`);
+  if (cardData.scenario) cardSummaryParts.push(`Сценарий:\n${cardData.scenario}`);
+  if (cardData.first_mes) cardSummaryParts.push(`Первое сообщение:\n${cardData.first_mes}`);
+  if (cardData.mes_example) cardSummaryParts.push(`Примеры диалогов:\n${cardData.mes_example}`);
+  if (cardData.system_prompt) cardSummaryParts.push(`Системный промпт:\n${cardData.system_prompt}`);
+  if (cardData.post_history_instructions) cardSummaryParts.push(`Post-history:\n${cardData.post_history_instructions}`);
+
+  if (Array.isArray(cardData.alternate_greetings) && cardData.alternate_greetings.length > 0) {
+    cardSummaryParts.push(`Альтернативные приветствия (${cardData.alternate_greetings.length}):\n${cardData.alternate_greetings.join('\n---\n')}`);
+  }
+
+  if (cardData.character_book && Array.isArray(cardData.character_book.entries)) {
+    const loreCount = cardData.character_book.entries.length;
+    const sampleLore = cardData.character_book.entries.slice(0, 10).map(e => `[${e.comment || 'Запись'}: ${(Array.isArray(e.keys) ? e.keys.join(', ') : e.keys) || ''}] ${e.content}`).join('\n');
+    cardSummaryParts.push(`Лорбук (${loreCount} записей):\n${sampleLore}`);
+  }
+
+  const systemPrompt = `Ты — ведущий эксперт по карточкам персонажей для текстовых ролевых систем (SillyTavern, Chub, TavernAI).
+Твоя задача — внимательно проанализировать предоставленную карточку персонажа и дать исчерпывающий, глубокий, структурированный и понятный ответ на вопрос пользователя.
+
+ПРАВИЛА ОТВЕТА:
+1. Отвечай на русском языке, живо, выразительно и структурированно (используй абзацы, подзаголовки, списки).
+2. Раскрывай психологию, скрытые мотивы персонажа, тонкости отыгрыша, динамику отношений с {{user}}, структуру сценария или скрытые директивы в зависимости от вопроса.
+3. Сохраняй макросы вроде {{char}} и {{user}} в объяснениях.`;
+
+  const userContent = `ДАННЫЕ КАРТОЧКИ ПЕРСОНАЖА:\n\n${cardSummaryParts.join('\n\n====================\n\n')}\n\nВОПРОС ПОЛЬЗОВАТЕЛЯ:\n${question.trim()}`;
+
+  const requestBody = {
+    model: settings.model || 'deepseek/deepseek-chat',
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userContent }
+    ],
+    temperature: 0.4,
+    max_tokens: parseInt(settings.maxTokens, 10) || 8192,
+    stream: false
+  };
+
+  try {
+    const rawContent = await postChatCompletion({
+      rawEndpoint,
+      requestBody,
+      headers,
+      provider: settings.provider,
+      signal
+    });
+    return rawContent;
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error('Запрос был отменен пользователем.');
+    throw err;
+  }
+}
+
+/**
+ * Modifies/adapts a character card according to a creative user prompt/instruction.
+ * Returns modified fields (name, description, personality, scenario, first_mes, mes_example, etc.) and a summary of changes.
+ */
+export async function transformCharacterAI({
+  cardData,
+  instruction,
+  settings,
+  signal = null
+}) {
+  if (!instruction || !instruction.trim()) {
+    throw new Error('Инструкция по изменению не может быть пустой.');
+  }
+
+  if ((settings.provider === 'nanogpt' || settings.provider === 'openrouter') && (!settings.apiKey || !settings.apiKey.trim())) {
+    throw new Error('API-ключ не задан! Откройте «⚙️ Настройки API» и вставьте ваш ключ от ' + (settings.provider === 'nanogpt' ? 'Nano-GPT' : 'OpenRouter') + '.');
+  }
+
+  const cleanBaseUrl = settings.baseUrl.replace(/\/+$/, '');
+  const rawEndpoint = `${cleanBaseUrl}/chat/completions`;
+
+  const headers = {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json'
+  };
+
+  if (settings.apiKey) {
+    const trimmedKey = settings.apiKey.trim();
+    headers['Authorization'] = `Bearer ${trimmedKey}`;
+    headers['x-api-key'] = trimmedKey;
+  }
+
+  if (settings.provider === 'openrouter') {
+    headers['HTTP-Referer'] = window.location.origin || 'http://localhost';
+    headers['X-Title'] = 'AI Character Card Translator';
+  }
+
+  const fields = ['name', 'description', 'personality', 'scenario', 'first_mes', 'mes_example', 'system_prompt'];
+  const xmlPayload = [];
+  for (const f of fields) {
+    if (cardData[f] && String(cardData[f]).trim()) {
+      xmlPayload.push(`<${f}>\n${cardData[f]}\n</${f}>`);
+    }
+  }
+
+  const systemPrompt = `Ты — профессиональный писатель и геймдизайнер ролевых карточек для SillyTavern / Chub / TavernAI.
+Твоя задача — творчески переработать и адаптировать карточку персонажа СТРОГО в соответствии с инструкцией/задачей пользователя.
+
+КРИТИЧЕСКИ ВАЖНЫЕ ПРАВИЛА:
+1. СТРОГО СОХРАНЯЙ ПЕРЕМЕННЫЕ И МАКРОСЫ:
+   - {{char}}, {{user}}, {{original}}, <START> НЕЛЬЗЯ удалять или заменять на статичные имена! Оставляй именно {{char}} и {{user}}!
+   - Макросы {{sub}} и {{obj}} (из JanitorAI) заменяй на {{user}}!
+2. СТИЛЬ И ФОРМАТИРОВАНИЕ РОЛЕВОЙ ИГРЫ:
+   - Действия персонажа в звездочках *действие*.
+   - Прямая речь персонажей в кавычках («...» или "...").
+   - Разделители диалогов <START> на отдельных строках.
+   - Сохраняй естественный живой литературный язык, атмосферность и психологическую глубину.
+3. ФОРМАТ ОТВЕТА (СТРОГО XML-ТЕГИ):
+   - Оберни обновленные поля в соответствующие XML-теги: <name>, <description>, <personality>, <scenario>, <first_mes>, <mes_example>, <system_prompt>.
+   - Обязательно добавь тег <changes_summary>...</changes_summary>, в котором на русском языке в 2-4 пунктах кратко опиши, что конкретно было изменено по задаче пользователя.
+   - Не добавляй никакого текста вне XML-тегов. Выводи только запрошенные теги.`;
+
+  const userContent = `ТЕКУЩИЕ ПОЛЯ КАРТОЧКИ:\n\n${xmlPayload.join('\n\n')}\n\nТВОРЧЕСКАЯ ЗАДАЧА / ИНСТРУКЦИЯ ПО ИЗМЕНЕНИЮ:\n${instruction.trim()}`;
+
+  const requestBody = {
+    model: settings.model || 'deepseek/deepseek-chat',
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userContent }
+    ],
+    temperature: 0.5,
+    max_tokens: parseInt(settings.maxTokens, 10) || 8192,
+    stream: false
+  };
+
+  try {
+    const rawContent = await postChatCompletion({
+      rawEndpoint,
+      requestBody,
+      headers,
+      provider: settings.provider,
+      signal
+    });
+
+    const xmlFields = parseXmlFields(rawContent);
+    const modifiedFields = {};
+
+    for (const f of fields) {
+      if (xmlFields[f] !== undefined) {
+        if (f === 'name') {
+          modifiedFields.name = xmlFields.name.trim();
+        } else {
+          modifiedFields[f] = repairMacrosAndTags(balanceAsterisks(xmlFields[f]));
+        }
+      }
+    }
+
+    const changesSummary = xmlFields.changes_summary || 'Изменения успешно внесены в соответствии с инструкцией.';
+
+    return {
+      modifiedFields,
+      changesSummary: repairMacrosAndTags(changesSummary)
+    };
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error('Трансформация была отменена пользователем.');
+    throw err;
   }
 }
 
@@ -880,7 +1143,7 @@ export async function translateText({
       { role: 'user', content: userContent }
     ],
     temperature: parseFloat(settings.temperature) || 0.3,
-    max_tokens: parseInt(settings.maxTokens, 10) || 4096,
+    max_tokens: parseInt(settings.maxTokens, 10) || 8192,
     stream: false
   };
 
