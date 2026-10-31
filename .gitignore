@@ -4,3 +4,8 @@
 .DS_Store
 Thumbs.db
 *.zip
+
+.venv-build/
+build/
+dist/
+*.spec

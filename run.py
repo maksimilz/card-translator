@@ -8,12 +8,14 @@ Streaming (text/event-stream) responses are passed through chunk by chunk.
     python run.py [--port 8000] [--no-browser] [--insecure]
 """
 import argparse
+import functools
 import gzip
 import ipaddress
 import json
 import os
 import socket
 import ssl
+import sys
 import threading
 import time
 import urllib.error
@@ -276,14 +278,30 @@ class ProxyAndStaticServer(SimpleHTTPRequestHandler):
         log('HTTP', format % args)
 
 
+def resource_dir():
+    """Folder with index.html/css/js: next to this file, or the unpacked bundle inside the exe."""
+    return getattr(sys, '_MEIPASS', None) or os.path.dirname(os.path.abspath(__file__))
+
+
+def create_server(port, directory=None):
+    handler = functools.partial(ProxyAndStaticServer, directory=directory or resource_dir())
+    return ThreadingHTTPServer(('127.0.0.1', port), handler)
+
+
+def port_is_free(port):
+    # A plain bind without SO_REUSEADDR: on Windows the server socket sets it and could share a busy port
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(('127.0.0.1', port))
+            return True
+        except OSError:
+            return False
+
+
 def find_free_port(start_port=8000, max_attempts=20):
     for p in range(start_port, start_port + max_attempts):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            try:
-                s.bind(('127.0.0.1', p))
-                return p
-            except OSError:
-                continue
+        if port_is_free(p):
+            return p
     return start_port
 
 
@@ -300,11 +318,9 @@ def main():
     if args.insecure:
         SSL_CTX = ssl._create_unverified_context()
 
-    os.chdir(os.path.dirname(os.path.abspath(__file__)))
-
     port = args.port or find_free_port(8000)
     url = f"http://127.0.0.1:{port}"
-    server = ThreadingHTTPServer(('127.0.0.1', port), ProxyAndStaticServer)
+    server = create_server(port)
 
     print("=" * 60)
     print(" AI Character Card Translator & Editor")

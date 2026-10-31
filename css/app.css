@@ -90,16 +90,10 @@ code {
 }
 
 .brand-logo {
-  font-size: 20px;
-  background: linear-gradient(135deg, #6366f1, #ec4899);
   width: 36px;
   height: 36px;
   flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: var(--radius-md);
-  box-shadow: 0 0 14px rgba(99, 102, 241, 0.35);
+  filter: drop-shadow(0 0 8px rgba(99, 102, 241, 0.35));
 }
 
 .brand-title h1 {
