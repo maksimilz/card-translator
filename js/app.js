@@ -1,7 +1,7 @@
 /**
  * Main Application Controller
- * Orchestrates Card Loading, PNG Parsing/Embedding, Side-by-side Editor,
- * Batch Translation, Model Settings, and Two-copy Export.
+ * Card loading, row-aligned original/translation editor, 2-step translation,
+ * passport editing, assistant, draft autosave and export.
  */
 
 import {
@@ -14,43 +14,53 @@ import {
 import {
   normalizeCard,
   cloneCard,
-  serializeV2Card,
+  toExportJson,
   calculateCardStats,
   countStats,
-  TRANSLATABLE_FIELDS,
-  replaceSubObj,
+  TEXT_FIELDS,
   hasSubObjMacros
 } from './card-parser.js';
 
 import {
   loadSettings,
   saveSettings,
-  translateText,
-  translateFullCard,
   analyzeCardContext,
+  buildTranslationUnits,
+  translateUnits,
+  applyTranslations,
+  checkFormatting,
   askCharacterAI,
   transformCharacterAI,
   fetchAvailableModels,
   PROVIDER_PRESETS,
-  DEFAULT_PROMPT_RU
+  DEFAULT_SETTINGS
 } from './translator.js';
 
-// Application State
+import { saveDraft, loadDraft, clearDraft } from './draft-store.js';
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
 const state = {
   originalCard: null,
   translatedCard: null,
-  originalImageBytes: null,
+  // Exactly what the user opened, for "download original" (kind: png | json | demo)
+  source: null,
   currentImageBytes: null,
   avatarUrl: null,
-  originalFileName: 'character',
-  settings: loadSettings(),
-  abortController: null,
-  isTranslating: false,
   passport: null,
-  pendingTransform: null
+  failed: {},
+  busyIds: new Set(),
+  busy: false,
+  abortController: null,
+  assistantAbort: null,
+  pendingTransform: null,
+  rows: [],
+  settings: loadSettings()
 };
 
-// Built-in Demo Card for quick testing
+// Built-in demo card for quick testing
 const DEMO_CARD = {
   spec: 'chara_card_v2',
   spec_version: '2.0',
@@ -59,1767 +69,1631 @@ const DEMO_CARD = {
     description: 'Seraphina is a 27-year-old enigmatic arcane librarian and archivist of forgotten astral lore. She has silver-streaked dark hair, luminous amethyst eyes, and wears an antique velvet coat embroidered with celestial constellations. Despite her quiet demeanor, she possesses a razor-sharp intellect and a subtle, dry sense of humor.',
     personality: 'Curious, scholarly, guarded yet compassionate, dry wit, highly perceptive.',
     scenario: '{{user}} enters the forbidden underground section of the Grand Astral Library during a stormy night, seeking a forbidden manuscript. Seraphina discovers {{user}} inspecting a restricted tome.',
-    first_mes: '*Rain lashes relentlessly against the stained-glass arches of the Grand Library. The scent of aged parchment, dried lavender, and ozone fills the chilled air.* \n\n*A soft, rhythmic clicking of heels echoes from behind a row of towering mahogany bookshelves. Seraphina emerges from the shadows, a glowing crystal lantern casting dancing violet hues across her pale face.*\n\n"You are treading on dangerous ground, {{user}}," *she murmurs, tilting her head with a faintly arched eyebrow.* "Those texts were sealed three centuries ago for a reason. Are you lost, or simply reckless?"',
+    first_mes: '*Rain lashes relentlessly against the stained-glass arches of the Grand Library. The scent of aged parchment, dried lavender, and ozone fills the chilled air.*\n\n*A soft, rhythmic clicking of heels echoes from behind a row of towering mahogany bookshelves. Seraphina emerges from the shadows, a glowing crystal lantern casting dancing violet hues across her pale face.*\n\n"You are treading on dangerous ground, {{user}}," *she murmurs, tilting her head with a faintly arched eyebrow.* "Those texts were sealed three centuries ago for a reason. Are you lost, or simply reckless?"',
     mes_example: '<START>\n{{user}}: "I only wanted to learn the truth about the Eclipse."\n{{char}}: *Seraphina\'s expression softens slightly, though her guarded posture remains.* "The truth is rarely as romantic as wanderers imagine. But if your resolve is genuine... sit. Let us see if your mind can endure what the stars whisper."',
     creator_notes: 'Designed for immersive fantasy roleplay. Prefers detailed narrative style and atmospheric prose.',
     system_prompt: 'Roleplay as Seraphina Vale. Maintain an enigmatic, intellectual, and atmospheric tone. Never break character.',
     post_history_instructions: 'Keep responses focused on dialogue, atmospheric details, and character reactions.',
     alternate_greetings: [
-      '*Seraphina is sitting at a large oak desk surrounded by floating runic scrolls, barely looking up as {{user}} enters.* \n\n"I heard your footsteps from the vestibule. State your purpose quickly, before the library wards take notice."',
-      '*The library is in complete silence until a sudden rumble of thunder rattles the crystal chandeliers. Seraphina suddenly appears beside {{user}} with uncanny silence.* \n\n"Seeking forbidden knowledge in the dark? How dreadfully clichéd."'
+      '*Seraphina is sitting at a large oak desk surrounded by floating runic scrolls, barely looking up as {{user}} enters.*\n\n"I heard your footsteps from the vestibule. State your purpose quickly, before the library wards take notice."',
+      '*The library is in complete silence until a sudden rumble of thunder rattles the crystal chandeliers. Seraphina suddenly appears beside {{user}} with uncanny silence.*\n\n"Seeking forbidden knowledge in the dark? How dreadfully clichéd."'
     ],
     tags: ['fantasy', 'magic', 'librarian', 'scholar', 'mystery'],
     creator: 'TavernMaster',
     character_version: '1.2',
+    character_book: {
+      name: 'Grand Astral Library',
+      entries: [
+        { keys: ['Eclipse', 'the Eclipse'], content: 'The Eclipse is a forbidden ritual that once tore the veil between the stars and the mortal realm. All records of it were sealed in the library vaults.', comment: 'The Eclipse', enabled: true, insertion_order: 100 },
+        { keys: ['wards', 'library wards'], content: 'Ancient protective wards guard the restricted sections. They react to fear and deceit, sealing doors and dimming lanterns.', comment: 'Library wards', enabled: true, insertion_order: 100 }
+      ]
+    },
     extensions: {}
   }
 };
 
-// DOM Elements
-const elements = {
-  welcomeView: document.getElementById('welcome-view'),
-  workspaceView: document.getElementById('workspace-view'),
-  fileInput: document.getElementById('file-input'),
-  avatarInput: document.getElementById('avatar-input'),
-  btnLoadFile: document.getElementById('btn-load-file'),
-  btnBrowseCard: document.getElementById('btn-browse-card'),
-  btnLoadDemo: document.getElementById('btn-load-demo'),
-  avatarContainer: document.getElementById('avatar-container'),
-  charAvatar: document.getElementById('char-avatar'),
-  bannerCharName: document.getElementById('banner-char-name'),
-  cardSpecBadge: document.getElementById('card-spec-badge'),
-  statOrigTokens: document.getElementById('stat-orig-tokens'),
-  statTransTokens: document.getElementById('stat-trans-tokens'),
-  origFieldsContainer: document.getElementById('orig-fields-container'),
-  transFieldsContainer: document.getElementById('trans-fields-container'),
-  origFieldsCount: document.getElementById('orig-fields-count'),
-  btnTranslateAll: document.getElementById('btn-translate-all'),
-  btnCancelTranslation: document.getElementById('btn-cancel-translation'),
-  btnCopyAllOrig: document.getElementById('btn-copy-all-orig'),
-  btnDownloadTransPng: document.getElementById('btn-download-trans-png'),
-  btnDownloadTransJson: document.getElementById('btn-download-trans-json'),
-  btnDownloadOrigPng: document.getElementById('btn-download-orig-png'),
-  btnDownloadOrigJson: document.getElementById('btn-download-orig-json'),
-  batchProgressContainer: document.getElementById('batch-progress-container'),
-  batchProgressBar: document.getElementById('batch-progress-bar'),
-  stepPill1: document.getElementById('step-pill-1'),
-  stepPill2: document.getElementById('step-pill-2'),
-  batchProgressText: document.getElementById('batch-progress-text'),
-  // Passport / Context Box
-  passportContainer: document.getElementById('passport-container'),
-  passportBadge: document.getElementById('passport-badge'),
-  btnTogglePassport: document.getElementById('btn-toggle-passport'),
-  passportContent: document.getElementById('passport-content'),
-  passportName: document.getElementById('passport-name'),
-  passportGender: document.getElementById('passport-gender'),
-  passportVerbGender: document.getElementById('passport-verb-gender'),
-  passportPronoun: document.getElementById('passport-pronoun'),
-  passportTone: document.getElementById('passport-tone'),
-  passportGlossaryBox: document.getElementById('passport-glossary-box'),
-  passportGlossaryList: document.getElementById('passport-glossary-list'),
-  passportLorebookBox: document.getElementById('passport-lorebook-box'),
-  passportLorebookList: document.getElementById('passport-lorebook-list'),
-  // Header status
-  headerProviderName: document.getElementById('header-provider-name'),
-  headerModelName: document.getElementById('header-model-name'),
-  // Settings Modal
-  settingsModal: document.getElementById('settings-modal'),
-  btnOpenSettings: document.getElementById('btn-open-settings'),
-  btnCloseSettings: document.getElementById('btn-close-settings'),
-  btnCancelSettings: document.getElementById('btn-cancel-settings'),
-  btnSaveSettings: document.getElementById('btn-save-settings'),
-  settingProvider: document.getElementById('setting-provider'),
-  providerHint: document.getElementById('provider-hint'),
-  groupApiKey: document.getElementById('group-api-key'),
-  settingApiKey: document.getElementById('setting-api-key'),
-  btnToggleKeyVisibility: document.getElementById('btn-toggle-key-visibility'),
-  settingBaseUrl: document.getElementById('setting-base-url'),
-  settingModelSelect: document.getElementById('setting-model-select'),
-  settingModelCustom: document.getElementById('setting-model-custom'),
-  btnRefreshModels: document.getElementById('btn-refresh-models'),
-  localCorsHelp: document.getElementById('local-cors-help'),
-  corsHelpText: document.getElementById('cors-help-text'),
-  settingSystemPrompt: document.getElementById('setting-system-prompt'),
-  btnResetPrompt: document.getElementById('btn-reset-prompt'),
-  settingTemperature: document.getElementById('setting-temperature'),
-  settingMaxTokens: document.getElementById('setting-max-tokens'),
-  // Assistant Modal
-  btnOpenAssistant: document.getElementById('btn-open-assistant'),
-  assistantModal: document.getElementById('assistant-modal'),
-  btnCloseAssistant: document.getElementById('btn-close-assistant'),
-  btnDismissAssistant: document.getElementById('btn-dismiss-assistant'),
-  tabBtnAsk: document.getElementById('tab-btn-ask'),
-  tabBtnTransform: document.getElementById('tab-btn-transform'),
-  paneAsk: document.getElementById('pane-ask'),
-  paneTransform: document.getElementById('pane-transform'),
-  assistantQuestionInput: document.getElementById('assistant-question-input'),
-  btnSendQuestion: document.getElementById('btn-send-question'),
-  assistantAskResultBox: document.getElementById('assistant-ask-result-box'),
-  assistantAskResultText: document.getElementById('assistant-ask-result-text'),
-  btnCopyAskResult: document.getElementById('btn-copy-ask-result'),
-  assistantTransformInput: document.getElementById('assistant-transform-input'),
-  assistantSourceSelect: document.getElementById('assistant-source-select'),
-  btnExecuteTransform: document.getElementById('btn-execute-transform'),
-  assistantTransformResultBox: document.getElementById('assistant-transform-result-box'),
-  transformSummaryText: document.getElementById('transform-summary-text'),
-  transformDiffList: document.getElementById('transform-diff-list'),
-  btnApplyTransform: document.getElementById('btn-apply-transform'),
-  assistantStatusText: document.getElementById('assistant-status-text'),
-  // Console Drawer
-  btnToggleConsole: document.getElementById('btn-toggle-console'),
-  logCountBadge: document.getElementById('log-count-badge'),
-  logConsoleDrawer: document.getElementById('log-console-drawer'),
-  logConsoleBody: document.getElementById('log-console-body'),
-  btnCopyLogs: document.getElementById('btn-copy-logs'),
-  btnClearLogs: document.getElementById('btn-clear-logs'),
-  btnCloseLogConsole: document.getElementById('btn-close-log-console'),
-  // Overlay & Toasts
-  dragOverlay: document.getElementById('drag-overlay'),
-  toastContainer: document.getElementById('toast-container')
+const SECTION_TITLES = {
+  main: 'Основное',
+  greetings: 'Приветствия',
+  service: 'Служебные поля',
+  tags: 'Теги',
+  lore: 'Лорбук'
 };
 
-// Logging System (Outputs to both DevTools console and In-App Log Drawer)
+const STATUS_LABELS = {
+  done: 'переведено',
+  warning: 'проверить',
+  todo: 'не переведено',
+  failed: 'ошибка',
+  busy: 'в работе',
+  empty: 'пусто'
+};
+
+// ---------------------------------------------------------------------------
+// DOM helpers
+// ---------------------------------------------------------------------------
+
+const $ = (id) => document.getElementById(id);
+
+const el = {
+  welcomeView: $('welcome-view'),
+  workspaceView: $('workspace-view'),
+  fileInput: $('file-input'),
+  avatarInput: $('avatar-input'),
+  btnLoadFile: $('btn-load-file'),
+  btnBrowseCard: $('btn-browse-card'),
+  btnLoadDemo: $('btn-load-demo'),
+  draftRestore: $('draft-restore'),
+  draftRestoreInfo: $('draft-restore-info'),
+  btnRestoreDraft: $('btn-restore-draft'),
+  btnDiscardDraft: $('btn-discard-draft'),
+  avatarContainer: $('avatar-container'),
+  charAvatar: $('char-avatar'),
+  bannerCharName: $('banner-char-name'),
+  cardSpecBadge: $('card-spec-badge'),
+  statTokens: $('stat-tokens'),
+  statProgress: $('stat-progress'),
+  draftStatus: $('draft-status'),
+  btnTranslateAll: $('btn-translate-all'),
+  btnRetryFailed: $('btn-retry-failed'),
+  btnCancelTranslation: $('btn-cancel-translation'),
+  btnDownloadTransPng: $('btn-download-trans-png'),
+  exportMenu: $('export-menu'),
+  progressPanel: $('batch-progress-container'),
+  progressBar: $('batch-progress-bar'),
+  progressText: $('batch-progress-text'),
+  progressDetail: $('batch-progress-detail'),
+  stepPill1: $('step-pill-1'),
+  stepPill2: $('step-pill-2'),
+  passportContainer: $('passport-container'),
+  passportContent: $('passport-content'),
+  passportBadge: $('passport-badge'),
+  btnTogglePassport: $('btn-toggle-passport'),
+  btnReanalyzePassport: $('btn-reanalyze-passport'),
+  fieldNav: $('field-nav'),
+  editor: document.querySelector('.editor'),
+  editorRows: $('editor-rows'),
+  toggleHideEmpty: $('toggle-hide-empty'),
+  headerProviderName: $('header-provider-name'),
+  headerModelName: $('header-model-name'),
+  btnModelPill: $('btn-model-pill'),
+  // Settings
+  settingsModal: $('settings-modal'),
+  btnOpenSettings: $('btn-open-settings'),
+  btnCloseSettings: $('btn-close-settings'),
+  btnCancelSettings: $('btn-cancel-settings'),
+  btnSaveSettings: $('btn-save-settings'),
+  settingProvider: $('setting-provider'),
+  providerHint: $('provider-hint'),
+  settingApiKey: $('setting-api-key'),
+  btnToggleKeyVisibility: $('btn-toggle-key-visibility'),
+  settingBaseUrl: $('setting-base-url'),
+  settingModelSelect: $('setting-model-select'),
+  settingModelCustom: $('setting-model-custom'),
+  btnRefreshModels: $('btn-refresh-models'),
+  localCorsHelp: $('local-cors-help'),
+  corsHelpText: $('cors-help-text'),
+  settingTemperature: $('setting-temperature'),
+  settingMaxTokens: $('setting-max-tokens'),
+  settingStream: $('setting-stream'),
+  settingTranslateTags: $('setting-translate-tags'),
+  settingExtraInstructions: $('setting-extra-instructions'),
+  // Assistant
+  btnOpenAssistant: $('btn-open-assistant'),
+  assistantModal: $('assistant-modal'),
+  btnCloseAssistant: $('btn-close-assistant'),
+  btnDismissAssistant: $('btn-dismiss-assistant'),
+  tabBtnAsk: $('tab-btn-ask'),
+  tabBtnTransform: $('tab-btn-transform'),
+  paneAsk: $('pane-ask'),
+  paneTransform: $('pane-transform'),
+  assistantQuestionInput: $('assistant-question-input'),
+  btnSendQuestion: $('btn-send-question'),
+  assistantAskResultBox: $('assistant-ask-result-box'),
+  assistantAskResultText: $('assistant-ask-result-text'),
+  btnCopyAskResult: $('btn-copy-ask-result'),
+  assistantTransformInput: $('assistant-transform-input'),
+  assistantSourceSelect: $('assistant-source-select'),
+  btnExecuteTransform: $('btn-execute-transform'),
+  assistantTransformResultBox: $('assistant-transform-result-box'),
+  transformSummaryText: $('transform-summary-text'),
+  transformDiffList: $('transform-diff-list'),
+  btnApplyTransform: $('btn-apply-transform'),
+  assistantStatusText: $('assistant-status-text'),
+  // Choice dialog
+  choiceModal: $('choice-modal'),
+  choiceTitle: $('choice-title'),
+  choiceText: $('choice-text'),
+  choiceActions: $('choice-actions'),
+  // Logs
+  btnToggleConsole: $('btn-toggle-console'),
+  logCountBadge: $('log-count-badge'),
+  logDrawer: $('log-console-drawer'),
+  logBody: $('log-console-body'),
+  btnCopyLogs: $('btn-copy-logs'),
+  btnClearLogs: $('btn-clear-logs'),
+  btnCloseLogConsole: $('btn-close-log-console'),
+  dragOverlay: $('drag-overlay'),
+  toastContainer: $('toast-container')
+};
+
+/**
+ * Tiny element builder: h('div', { className: 'x', dataset: { a: 1 } }, 'text', child)
+ * Text is always set via text nodes, so card content can never inject HTML.
+ */
+function h(tag, props = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(props || {})) {
+    if (value === undefined || value === null || value === false) continue;
+    if (key === 'dataset') Object.assign(node.dataset, value);
+    else if (key in node && key !== 'list') node[key] = value;
+    else node.setAttribute(key, value === true ? '' : value);
+  }
+  for (const child of children.flat()) {
+    if (child === null || child === undefined || child === false) continue;
+    node.append(child instanceof Node ? child : String(child));
+  }
+  return node;
+}
+
+function formatTime(ts = Date.now()) {
+  return new Date(ts).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+}
+
+function safeFileName(name) {
+  return String(name || '').replace(/[\\/:*?"<>|\x00-\x1f]+/g, '_').replace(/\s+/g, ' ').trim().slice(0, 80) || 'character';
+}
+
+// ---------------------------------------------------------------------------
+// Logging & toasts
+// ---------------------------------------------------------------------------
+
 let logCounter = 0;
 const logBuffer = [];
 
 export function appLog(message, type = 'info') {
-  const now = new Date();
-  const timeStr = now.toTimeString().split(' ')[0];
+  const timeStr = new Date().toTimeString().split(' ')[0];
   logCounter++;
-
-  // 1. Output to browser DevTools console with distinct styling
-  const styles = {
-    info: 'color: #818cf8; font-weight: bold;',
-    success: 'color: #34d399; font-weight: bold;',
-    warning: 'color: #fbbf24; font-weight: bold;',
-    error: 'color: #f87171; font-weight: bold;'
-  };
   const tag = `[CardTranslator ${timeStr}]`;
-  if (type === 'error') {
-    console.error(`%c${tag}%c ${message}`, styles[type] || styles.info, 'color: inherit;');
-  } else if (type === 'warning') {
-    console.warn(`%c${tag}%c ${message}`, styles[type] || styles.info, 'color: inherit;');
-  } else {
-    console.log(`%c${tag}%c ${message}`, styles[type] || styles.info, 'color: inherit;');
-  }
+  const method = type === 'error' ? 'error' : type === 'warning' ? 'warn' : 'log';
+  console[method](`${tag} ${message}`);
 
-  // 2. Output to in-app log drawer
-  if (elements.logCountBadge) {
-    elements.logCountBadge.textContent = logCounter;
-    elements.logCountBadge.style.display = 'inline-block';
-  }
-
+  el.logCountBadge.textContent = logCounter;
   logBuffer.push(`[${timeStr}] [${type.toUpperCase()}] ${message}`);
+  el.logBody.append(h('div', { className: 'log-entry' },
+    h('span', { className: 'log-time' }, timeStr),
+    h('span', { className: `log-badge ${type}` }, type.toUpperCase()),
+    h('span', { className: 'log-text' }, message)
+  ));
+  el.logBody.scrollTop = el.logBody.scrollHeight;
+}
 
-  if (elements.logConsoleBody) {
-    const row = document.createElement('div');
-    row.className = 'log-entry';
-    row.innerHTML = `
-      <span class="log-time">[${timeStr}]</span>
-      <span class="log-badge ${type}">${type.toUpperCase()}</span>
-      <span class="log-text">${escapeHtml(message)}</span>
-    `;
-    elements.logConsoleBody.appendChild(row);
-    elements.logConsoleBody.scrollTop = elements.logConsoleBody.scrollHeight;
+/**
+ * Toast notification. `action` = { label, onClick } adds a button (e.g. "Отменить").
+ */
+function showToast(message, type = 'info', { duration, action } = {}) {
+  const toast = h('div', { className: `toast toast-${type}`, role: type === 'error' ? 'alert' : 'status' });
+  const close = () => {
+    toast.classList.add('is-leaving');
+    setTimeout(() => toast.remove(), 300);
+  };
+  toast.append(h('div', { className: 'toast-text' }, message));
+  if (action) {
+    toast.append(h('button', {
+      className: 'btn btn-ghost btn-xs',
+      type: 'button',
+      onclick: () => { action.onClick(); close(); }
+    }, action.label));
+  }
+  toast.append(h('button', { className: 'toast-close', type: 'button', title: 'Закрыть', onclick: close }, '✕'));
+  el.toastContainer.append(toast);
+  setTimeout(close, duration ?? (type === 'error' ? 12000 : action ? 8000 : 4000));
+}
+
+/**
+ * Modal choice dialog. Resolves with the chosen option value, or null on cancel/Escape.
+ */
+let resolveChoice = null;
+
+function askChoice(title, text, options) {
+  if (resolveChoice) resolveChoice(null);
+  return new Promise(resolve => {
+    resolveChoice = (value) => {
+      resolveChoice = null;
+      el.choiceModal.classList.remove('active');
+      resolve(value);
+    };
+    el.choiceTitle.textContent = title;
+    el.choiceText.textContent = text;
+    el.choiceActions.replaceChildren(...options.map(opt => h('button', {
+      className: `btn ${opt.kind || 'btn-secondary'}`,
+      type: 'button',
+      onclick: () => resolveChoice(opt.value)
+    }, opt.label)));
+    el.choiceModal.classList.add('active');
+    el.choiceActions.lastElementChild?.focus();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Data binding: paths shared with translation unit ids
+//   field:<key> | greeting:<i> | group_greeting:<i> | tags | lore_name | lore_desc | entry:<i>:<prop>
+// ---------------------------------------------------------------------------
+
+function listToText(value) {
+  return Array.isArray(value) ? value.join(', ') : (value ?? '');
+}
+
+function textToList(value) {
+  return String(value || '').split(/[\n,;]+/).map(s => s.trim()).filter(Boolean);
+}
+
+function getBound(data, path) {
+  const [kind, a, b] = path.split(':');
+  switch (kind) {
+    case 'field': return String(data[a] ?? '');
+    case 'greeting': return String(data.alternate_greetings?.[Number(a)] ?? '');
+    case 'group_greeting': return String(data.group_only_greetings?.[Number(a)] ?? '');
+    case 'tags': return listToText(data.tags);
+    case 'lore_name': return String(data.character_book?.name ?? '');
+    case 'lore_desc': return String(data.character_book?.description ?? '');
+    case 'entry': {
+      const entry = data.character_book?.entries?.[Number(a)];
+      return entry ? String(listToText(entry[b])) : '';
+    }
+    default: return '';
   }
 }
 
-/**
- * Toast Notifications
- */
-function showToast(message, type = 'info', duration = 4000) {
-  const toast = document.createElement('div');
-  toast.className = `toast toast-${type}`;
-  const icons = { success: '✅', error: '❌', info: 'ℹ️', warning: '⚠️' };
-  toast.innerHTML = `<span>${icons[type] || 'ℹ️'}</span><div style="flex:1;">${message}</div><button style="background:none;border:none;color:var(--text-muted);cursor:pointer;margin-left:8px;" onclick="this.parentElement.remove()">✕</button>`;
-  elements.toastContainer.appendChild(toast);
-  const actualDuration = type === 'error' ? 12000 : duration;
-  setTimeout(() => {
-    if (toast.parentElement) {
-      toast.style.opacity = '0';
-      toast.style.transform = 'translateY(-10px)';
-      toast.style.transition = 'all 0.3s ease';
-      setTimeout(() => toast.remove(), 300);
+function setBound(data, path, value) {
+  const [kind, a, b] = path.split(':');
+  switch (kind) {
+    case 'field':
+      data[a] = value;
+      break;
+    case 'greeting':
+    case 'group_greeting': {
+      const key = kind === 'greeting' ? 'alternate_greetings' : 'group_only_greetings';
+      if (!Array.isArray(data[key])) data[key] = [];
+      data[key][Number(a)] = value;
+      break;
     }
-  }, actualDuration);
+    case 'tags':
+      data.tags = textToList(value);
+      break;
+    case 'lore_name':
+    case 'lore_desc':
+      if (data.character_book) data.character_book[kind === 'lore_name' ? 'name' : 'description'] = value;
+      break;
+    case 'entry': {
+      const entry = data.character_book?.entries?.[Number(a)];
+      if (!entry) break;
+      entry[b] = (b === 'keys' || b === 'secondary_keys') ? textToList(value) : value;
+      break;
+    }
+  }
 }
 
-/**
- * Creates a placeholder PNG avatar canvas when JSON or no image is supplied
- */
+// ---------------------------------------------------------------------------
+// Rows
+// ---------------------------------------------------------------------------
+
+function buildRows(orig) {
+  const rows = [];
+  const fieldRow = (f) => ({
+    id: `field:${f.key}`,
+    section: f.section,
+    title: f.label,
+    hint: f.hint,
+    binds: [{ path: `field:${f.key}`, kind: f.key === 'name' ? 'line' : 'text' }]
+  });
+
+  TEXT_FIELDS.filter(f => f.section === 'main').forEach(f => rows.push(fieldRow(f)));
+
+  (orig.alternate_greetings || []).forEach((_, i) => rows.push({
+    id: `greeting:${i}`, section: 'greetings', title: `Альтернативное приветствие #${i + 1}`,
+    binds: [{ path: `greeting:${i}`, kind: 'text' }]
+  }));
+  (orig.group_only_greetings || []).forEach((_, i) => rows.push({
+    id: `group_greeting:${i}`, section: 'greetings', title: `Групповое приветствие #${i + 1}`,
+    binds: [{ path: `group_greeting:${i}`, kind: 'text' }]
+  }));
+
+  TEXT_FIELDS.filter(f => f.section === 'service').forEach(f => rows.push(fieldRow(f)));
+
+  rows.push({
+    id: 'tags', section: 'tags', title: 'Теги', hint: 'Через запятую',
+    binds: [{ path: 'tags', kind: 'list' }]
+  });
+
+  const book = orig.character_book;
+  if (book) {
+    if ((book.name || '').trim() || (book.description || '').trim()) {
+      rows.push({
+        id: 'lore_meta', section: 'lore', title: 'Лорбук: название и описание',
+        binds: [
+          { path: 'lore_name', kind: 'line', label: 'Название' },
+          { path: 'lore_desc', kind: 'text', label: 'Описание' }
+        ]
+      });
+    }
+    (book.entries || []).forEach((entry, i) => {
+      const binds = [
+        { path: `entry:${i}:comment`, kind: 'line', label: 'Название записи' },
+        { path: `entry:${i}:keys`, kind: 'keys', label: 'Ключи активации' }
+      ];
+      if (Array.isArray(entry.secondary_keys) && entry.secondary_keys.length) {
+        binds.push({ path: `entry:${i}:secondary_keys`, kind: 'keys', label: 'Доп. ключи' });
+      }
+      binds.push({ path: `entry:${i}:content`, kind: 'text', label: 'Содержание' });
+      rows.push({
+        id: `entry:${i}`,
+        section: 'lore',
+        title: `#${i + 1} ${entry.comment || (entry.keys || []).slice(0, 3).join(', ') || 'Запись'}`,
+        hint: entry.enabled === false ? 'выключена' : '',
+        binds
+      });
+    });
+  }
+  return rows;
+}
+
+function rowDomId(rowId) {
+  return `row-${rowId.replace(/[^a-zA-Z0-9_-]/g, '-')}`;
+}
+
+function rowWarnings(row) {
+  const orig = state.originalCard.data;
+  const trans = state.translatedCard.data;
+  const warnings = [];
+  for (const bind of row.binds) {
+    if (bind.kind !== 'text') continue;
+    const o = getBound(orig, bind.path);
+    const t = getBound(trans, bind.path);
+    if (t === o) continue;
+    for (const w of checkFormatting(o, t)) {
+      warnings.push(row.binds.length > 1 && bind.label ? `${bind.label}: ${w}` : w);
+    }
+  }
+  return warnings;
+}
+
+function rowStatus(row) {
+  const orig = state.originalCard.data;
+  const trans = state.translatedCard.data;
+  const paths = row.binds.map(b => b.path);
+  if (paths.some(p => state.busyIds.has(p))) return 'busy';
+  if (paths.some(p => state.failed[p])) return 'failed';
+  if (paths.every(p => !getBound(orig, p).trim())) return 'empty';
+  if (!paths.some(p => getBound(trans, p) !== getBound(orig, p))) return 'todo';
+  return rowWarnings(row).length ? 'warning' : 'done';
+}
+
+function isRowBlank(row) {
+  return row.binds.every(b => !getBound(state.originalCard.data, b.path).trim() && !getBound(state.translatedCard.data, b.path).trim());
+}
+
+function renderOrigValue(bind, value) {
+  if (bind.kind === 'keys' || bind.kind === 'list') {
+    const items = textToList(value);
+    return items.length
+      ? h('div', { className: 'key-chips' }, items.map(k => h('span', { className: 'key-chip' }, k)))
+      : h('div', { className: 'orig-text is-empty' }, '(пусто)');
+  }
+  return value.trim()
+    ? h('div', { className: 'orig-text' }, value)
+    : h('div', { className: 'orig-text is-empty' }, '(пусто)');
+}
+
+function renderTransInput(bind, value) {
+  if (bind.kind === 'text') {
+    return h('textarea', { className: 'field-textarea', dataset: { bind: bind.path }, rows: 3, spellcheck: true, value });
+  }
+  return h('input', { className: 'field-input', type: 'text', dataset: { bind: bind.path }, value });
+}
+
+function renderRow(row) {
+  const orig = state.originalCard.data;
+  const trans = state.translatedCard.data;
+  const multi = row.binds.length > 1;
+
+  const origCell = h('div', { className: 'orig-cell' });
+  const transCell = h('div', { className: 'trans-cell' });
+  for (const bind of row.binds) {
+    if (multi) {
+      origCell.append(h('div', { className: 'sub-label' }, bind.label));
+      transCell.append(h('div', { className: 'sub-label' }, bind.label));
+    }
+    origCell.append(renderOrigValue(bind, getBound(orig, bind.path)));
+    transCell.append(renderTransInput(bind, getBound(trans, bind.path)));
+  }
+
+  return h('article', { className: 'row', id: rowDomId(row.id), dataset: { row: row.id } },
+    h('header', { className: 'row-head' },
+      h('div', { className: 'row-title' },
+        h('h4', {}, row.title),
+        row.hint ? h('span', { className: 'row-hint' }, row.hint) : null
+      ),
+      h('div', { className: 'row-tools' },
+        h('span', { className: 'row-warnings' }),
+        h('span', { className: 'row-stats' }),
+        h('button', { className: 'btn btn-accent btn-xs', type: 'button', dataset: { act: 'translate' }, title: 'Перевести нейросетью' }, 'Перевести'),
+        h('button', { className: 'btn btn-ghost btn-xs', type: 'button', dataset: { act: 'reset' }, title: 'Вернуть текст оригинала' }, '↺ Оригинал')
+      )
+    ),
+    h('div', { className: 'row-body' }, origCell, transCell)
+  );
+}
+
+function renderEditor() {
+  const orig = state.originalCard.data;
+  state.rows = buildRows(orig);
+
+  const rowsFragment = document.createDocumentFragment();
+  const nav = document.createDocumentFragment();
+  let lastSection = null;
+
+  for (const row of state.rows) {
+    if (row.section !== lastSection) {
+      lastSection = row.section;
+      rowsFragment.append(h('div', { className: 'section-title', id: `section-${row.section}` }, SECTION_TITLES[row.section]));
+      nav.append(h('div', { className: 'nav-section-title' }, SECTION_TITLES[row.section]));
+    }
+    rowsFragment.append(renderRow(row));
+    nav.append(h('button', { className: 'nav-item', type: 'button', dataset: { goto: row.id } },
+      h('span', { className: 'dot' }),
+      h('span', {}, row.title)
+    ));
+  }
+
+  nav.append(h('div', { className: 'nav-legend' },
+    ['done', 'warning', 'todo', 'failed'].map(s => h('span', { dataset: { status: s } }, h('span', { className: 'dot' }), STATUS_LABELS[s]))
+  ));
+
+  el.editorRows.replaceChildren(rowsFragment);
+  el.fieldNav.replaceChildren(nav);
+  refreshAllRows();
+  requestAnimationFrame(() => el.editorRows.querySelectorAll('textarea').forEach(autoSize));
+}
+
+function autoSize(textarea) {
+  textarea.style.height = 'auto';
+  textarea.style.height = `${Math.min(textarea.scrollHeight + 2, window.innerHeight * 0.7)}px`;
+}
+
+function updateRow(row) {
+  const node = document.getElementById(rowDomId(row.id));
+  if (!node) return;
+  const status = rowStatus(row);
+  const blank = isRowBlank(row);
+  node.dataset.status = status;
+  node.classList.toggle('is-empty', blank);
+
+  const navItem = el.fieldNav.querySelector(`[data-goto="${CSS.escape(row.id)}"]`);
+  if (navItem) {
+    navItem.dataset.status = status;
+    navItem.classList.toggle('is-empty', blank);
+    navItem.title = STATUS_LABELS[status];
+  }
+
+  const chips = [];
+  const failedReason = row.binds.map(b => state.failed[b.path]).find(Boolean);
+  if (failedReason) chips.push(h('span', { className: 'warn-chip is-error' }, failedReason));
+  if (status === 'warning') chips.push(...rowWarnings(row).map(w => h('span', { className: 'warn-chip' }, w)));
+  node.querySelector('.row-warnings').replaceChildren(...chips);
+
+  const textBinds = row.binds.filter(b => b.kind === 'text');
+  if (textBinds.length) {
+    const o = textBinds.reduce((sum, b) => sum + countStats(getBound(state.originalCard.data, b.path)).estimatedTokens, 0);
+    const t = textBinds.reduce((sum, b) => sum + countStats(getBound(state.translatedCard.data, b.path)).estimatedTokens, 0);
+    node.querySelector('.row-stats').textContent = o ? `~${o} → ~${t} ток.` : '';
+  }
+
+  const translateBtn = node.querySelector('[data-act="translate"]');
+  translateBtn.disabled = state.busy || status === 'empty';
+}
+
+function refreshAllRows() {
+  state.rows.forEach(updateRow);
+  updateSummary();
+}
+
+function findRow(rowId) {
+  return state.rows.find(r => r.id === rowId);
+}
+
+function rowForPath(path) {
+  return state.rows.find(r => r.binds.some(b => b.path === path));
+}
+
+function syncInputFromState(path) {
+  const input = el.editorRows.querySelector(`[data-bind="${CSS.escape(path)}"]`);
+  if (!input) return;
+  input.value = getBound(state.translatedCard.data, path);
+  if (input.tagName === 'TEXTAREA') autoSize(input);
+}
+
+function updateSummary() {
+  if (!state.originalCard) return;
+  const origStats = calculateCardStats(state.originalCard);
+  const transStats = calculateCardStats(state.translatedCard);
+  el.statTokens.textContent = `~${origStats.estimatedTokens} → ~${transStats.estimatedTokens} токенов`;
+
+  const counted = state.rows.map(rowStatus).filter(s => s !== 'empty');
+  const done = counted.filter(s => s === 'done' || s === 'warning').length;
+  const warn = counted.filter(s => s === 'warning').length;
+  el.statProgress.textContent = `Переведено ${done} из ${counted.length}${warn ? ` · проверить: ${warn}` : ''}`;
+
+  // Section headers whose rows are all blank disappear together with the rows
+  for (const section of new Set(state.rows.map(r => r.section))) {
+    const blank = state.rows.filter(r => r.section === section).every(isRowBlank);
+    document.getElementById(`section-${section}`)?.classList.toggle('is-empty', blank);
+  }
+
+  const failedCount = Object.keys(state.failed).length;
+  el.btnRetryFailed.hidden = state.busy || failedCount === 0;
+  el.btnRetryFailed.textContent = `↻ Повторить неудавшиеся (${failedCount})`;
+
+  el.bannerCharName.textContent = state.translatedCard.data.name || state.originalCard.data.name || 'Безымянный персонаж';
+}
+
+// ---------------------------------------------------------------------------
+// Passport
+// ---------------------------------------------------------------------------
+
+function mapToText(map) {
+  return Object.entries(map || {}).map(([k, v]) => `${k} = ${v}`).join('\n');
+}
+
+function textToMap(text) {
+  const map = {};
+  for (const line of String(text || '').split('\n')) {
+    const m = line.match(/^\s*(.+?)\s*(?:=|→|->)\s*(.+?)\s*$/);
+    if (m) map[m[1]] = m[2];
+  }
+  return map;
+}
+
+function renderPassport() {
+  const p = state.passport;
+  el.passportContainer.hidden = !p;
+  if (!p) return;
+  el.passportContainer.querySelectorAll('[data-passport]').forEach(input => {
+    input.value = p[input.dataset.passport] ?? '';
+  });
+  el.passportContainer.querySelectorAll('[data-passport-map]').forEach(input => {
+    input.value = mapToText(p[input.dataset.passportMap]);
+  });
+  el.passportBadge.textContent = p.edited ? 'изменён вручную' : p.failed ? 'анализ не удался — заполните вручную' : 'Шаг 1';
+}
+
+// ---------------------------------------------------------------------------
+// Draft autosave
+// ---------------------------------------------------------------------------
+
+let saveTimer = null;
+
+function scheduleSave() {
+  if (!state.originalCard) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveNow, 800);
+}
+
+async function saveNow() {
+  clearTimeout(saveTimer);
+  if (!state.originalCard) return;
+  const ok = await saveDraft({
+    version: 2,
+    originalCard: state.originalCard,
+    translatedCard: state.translatedCard,
+    passport: state.passport,
+    failed: state.failed,
+    source: state.source,
+    currentImageBytes: state.currentImageBytes
+  });
+  el.draftStatus.textContent = ok ? `Черновик сохранён в ${formatTime()}` : 'Черновик не сохранён';
+}
+
+async function showDraftOffer() {
+  const draft = await loadDraft();
+  if (!draft?.originalCard || !draft?.translatedCard) {
+    el.draftRestore.hidden = true;
+    return;
+  }
+  const name = draft.translatedCard.data?.name || draft.originalCard.data?.name || 'Без имени';
+  const date = new Date(draft.savedAt || Date.now());
+  el.draftRestoreInfo.textContent = `${name} · сохранено ${date.toLocaleDateString('ru-RU')} в ${formatTime(date)}`;
+  el.draftRestore.hidden = false;
+}
+
+async function restoreDraft() {
+  const draft = await loadDraft();
+  if (!draft) return;
+  state.originalCard = draft.originalCard;
+  state.translatedCard = draft.translatedCard;
+  state.passport = draft.passport || null;
+  state.failed = draft.failed || {};
+  state.source = draft.source || null;
+  state.currentImageBytes = draft.currentImageBytes || await createPlaceholderAvatar(state.originalCard.data.name);
+  openWorkspace();
+  appLog(`Восстановлен черновик «${state.originalCard.data.name}».`, 'success');
+}
+
+// ---------------------------------------------------------------------------
+// Loading cards
+// ---------------------------------------------------------------------------
+
 function createPlaceholderAvatar(name = 'AI') {
   const canvas = document.createElement('canvas');
   canvas.width = 400;
-  canvas.height = 400;
+  canvas.height = 600;
   const ctx = canvas.getContext('2d');
-
-  // Stylish dark gradient
-  const grad = ctx.createLinearGradient(0, 0, 400, 400);
+  const grad = ctx.createLinearGradient(0, 0, 400, 600);
   grad.addColorStop(0, '#1e1b4b');
   grad.addColorStop(0.5, '#312e81');
   grad.addColorStop(1, '#4338ca');
   ctx.fillStyle = grad;
-  ctx.fillRect(0, 0, 400, 400);
-
-  // Border ring
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
-  ctx.lineWidth = 12;
-  ctx.strokeRect(10, 10, 380, 380);
-
-  // Initial letter or icon
+  ctx.fillRect(0, 0, 400, 600);
   ctx.fillStyle = '#ffffff';
-  ctx.font = 'bold 120px sans-serif';
+  ctx.font = 'bold 150px sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  const initial = (name || 'AI').trim().charAt(0).toUpperCase() || '🎭';
-  ctx.fillText(initial, 200, 190);
-
-  // Subtitle
-  ctx.font = '22px sans-serif';
+  ctx.fillText((name || 'AI').trim().charAt(0).toUpperCase() || '?', 200, 270);
+  ctx.font = '26px sans-serif';
   ctx.fillStyle = '#c7d2fe';
-  ctx.fillText(name.slice(0, 20) || 'Character Card', 200, 290);
-
+  ctx.fillText((name || 'Character').slice(0, 24), 200, 420);
   return new Promise(resolve => {
-    canvas.toBlob(async blob => {
-      const buf = await blob.arrayBuffer();
-      resolve(new Uint8Array(buf));
-    }, 'image/png');
+    canvas.toBlob(async blob => resolve(new Uint8Array(await blob.arrayBuffer())), 'image/png');
   });
 }
 
-/**
- * Renders Passport summary box (Step 1 output)
- */
-function renderPassport(passport) {
-  if (!passport) {
-    elements.passportContainer.style.display = 'none';
-    return;
-  }
+function setAvatar(bytes) {
+  if (state.avatarUrl) URL.revokeObjectURL(state.avatarUrl);
+  state.avatarUrl = URL.createObjectURL(new Blob([bytes], { type: 'image/png' }));
+  el.charAvatar.src = state.avatarUrl;
+}
 
-  elements.passportContainer.style.display = 'flex';
-  elements.passportName.textContent = passport.character_name_ru || '—';
-  elements.passportGender.textContent = passport.gender || '—';
-  elements.passportVerbGender.textContent = passport.verb_gender || '—';
-  elements.passportPronoun.textContent = passport.user_pronoun || '—';
-  elements.passportTone.textContent = passport.speech_tone || '—';
+function hasTranslationWork() {
+  if (!state.originalCard) return false;
+  return JSON.stringify(state.originalCard.data) !== JSON.stringify(state.translatedCard.data);
+}
 
-  const glossaryEntries = Object.entries(passport.glossary || {});
-  if (glossaryEntries.length > 0) {
-    elements.passportGlossaryBox.style.display = 'flex';
-    elements.passportGlossaryList.innerHTML = '';
-    glossaryEntries.forEach(([en, ru]) => {
-      const chip = document.createElement('span');
-      chip.className = 'glossary-chip';
-      chip.textContent = `${en} → ${ru}`;
-      elements.passportGlossaryList.appendChild(chip);
-    });
-  } else {
-    elements.passportGlossaryBox.style.display = 'none';
-  }
+async function confirmReplaceCurrent() {
+  if (!hasTranslationWork()) return true;
+  const choice = await askChoice(
+    'Открыть другую карточку?',
+    `Текущий перевод «${state.translatedCard.data.name}» будет закрыт, и черновик заменится новой карточкой. Скачайте перевод, если он нужен.`,
+    [
+      { label: 'Отмена', value: null },
+      { label: 'Скачать и открыть', value: 'download', kind: 'btn-success' },
+      { label: 'Открыть', value: 'open', kind: 'btn-primary' }
+    ]
+  );
+  if (choice === 'download') downloadTranslatedPNG();
+  return Boolean(choice);
+}
 
-  const lorebookEntries = Object.entries(passport.lorebook_keys || {});
-  if (elements.passportLorebookBox && lorebookEntries.length > 0) {
-    elements.passportLorebookBox.style.display = 'flex';
-    elements.passportLorebookList.innerHTML = '';
-    lorebookEntries.forEach(([en, ru]) => {
-      const chip = document.createElement('span');
-      chip.className = 'glossary-chip';
-      chip.style.borderColor = 'rgba(16, 185, 129, 0.4)';
-      chip.style.background = 'rgba(16, 185, 129, 0.1)';
-      chip.textContent = `${en} → ${ru}`;
-      elements.passportLorebookList.appendChild(chip);
-    });
-  } else if (elements.passportLorebookBox) {
-    elements.passportLorebookBox.style.display = 'none';
+async function loadCardIntoApp(cardJson, { imageBytes = null, fileName = 'character', kind = 'json', rawBytes = null } = {}) {
+  const hadSubObj = hasSubObjMacros(cardJson);
+  const normalized = normalizeCard(cardJson);
+
+  state.originalCard = cloneCard(normalized);
+  state.translatedCard = cloneCard(normalized);
+  state.passport = null;
+  state.failed = {};
+  state.source = { kind, name: fileName, rawJson: cardJson, bytes: rawBytes };
+  state.currentImageBytes = (imageBytes && isPNG(imageBytes))
+    ? new Uint8Array(imageBytes)
+    : await createPlaceholderAvatar(normalized.data.name);
+
+  openWorkspace();
+  saveNow();
+
+  const stats = calculateCardStats(state.originalCard);
+  const loreCount = state.originalCard.data.character_book?.entries?.length || 0;
+  showToast(`Карточка «${state.originalCard.data.name || 'Персонаж'}» загружена`, 'success');
+  appLog(`Карточка «${state.originalCard.data.name || 'Безымянный'}» загружена (${state.originalCard.spec}, ~${stats.estimatedTokens} токенов${loreCount ? `, лорбук: ${loreCount}` : ''}).`, 'success');
+  if (hadSubObj) {
+    showToast('Макросы JanitorAI {{sub}} / {{obj}} заменены на {{user}}', 'info');
+    appLog('Макросы JanitorAI {{sub}} / {{obj}} заменены на {{user}}.');
   }
 }
 
-/**
- * Loads and initializes a character card in the application
- */
-async function loadCardIntoApp(cardJson, imageBytes = null, fileName = 'character') {
-  try {
-    // Revoke previous avatar ObjectURL to prevent memory leaks
-    if (state.avatarUrl) {
-      URL.revokeObjectURL(state.avatarUrl);
-      state.avatarUrl = null;
-    }
-
-    const hadSubObj = hasSubObjMacros(cardJson);
-    const normalized = normalizeCard(cardJson);
-    state.originalCard = cloneCard(normalized);
-    state.translatedCard = cloneCard(normalized);
-    state.originalFileName = fileName.replace(/\.[^/.]+$/, '');
-    state.passport = null;
-
-    if (imageBytes && isPNG(imageBytes)) {
-      state.originalImageBytes = imageBytes;
-      state.currentImageBytes = new Uint8Array(imageBytes);
-      const blob = new Blob([imageBytes], { type: 'image/png' });
-      state.avatarUrl = URL.createObjectURL(blob);
-    } else {
-      // Create fallback avatar
-      const placeholder = await createPlaceholderAvatar(normalized.data.name);
-      state.originalImageBytes = placeholder;
-      state.currentImageBytes = new Uint8Array(placeholder);
-      const blob = new Blob([placeholder], { type: 'image/png' });
-      state.avatarUrl = URL.createObjectURL(blob);
-    }
-
-    // Update UI
-    elements.welcomeView.style.display = 'none';
-    elements.workspaceView.style.display = 'flex';
-    elements.charAvatar.src = state.avatarUrl;
-    elements.bannerCharName.textContent = state.originalCard.data.name || 'Безымянный персонаж';
-    elements.cardSpecBadge.textContent = `${state.originalCard.spec} (v${state.originalCard.spec_version})`;
-
-    renderPassport(null);
-    renderFields();
-    updateCardStats();
-    showToast(`Карточка «${state.originalCard.data.name || 'Персонаж'}» успешно загружена!`, 'success');
-    const stats = calculateCardStats(state.originalCard);
-    const loreCount = state.originalCard.data.character_book?.entries?.length || 0;
-    const loreInfo = loreCount > 0 ? `, лорбук: ${loreCount} записей` : '';
-    appLog(`Карточка «${state.originalCard.data.name || 'Безымянный'}» загружена (${state.originalCard.spec}, ~${stats.estimatedTokens} токенов${loreInfo}).`, 'success');
-    if (hadSubObj) {
-      showToast('Макросы JanitorAI ({{sub}} / {{obj}}) автоматически заменены на {{user}}!', 'info', 4500);
-      appLog('Обнаружены макросы JanitorAI {{sub}} / {{obj}}: успешно заменены на {{user}}.', 'info');
-    }
-  } catch (err) {
-    showToast('Ошибка при загрузке карточки: ' + err.message, 'error');
-    appLog('Ошибка при загрузке карточки: ' + err.message, 'error');
-  }
+function openWorkspace() {
+  el.welcomeView.hidden = true;
+  el.workspaceView.hidden = false;
+  setAvatar(state.currentImageBytes);
+  const spec = state.originalCard.spec === 'chara_card_v3' ? 'V3' : 'V2';
+  const loreCount = state.originalCard.data.character_book?.entries?.length || 0;
+  el.cardSpecBadge.textContent = loreCount ? `${spec} · лорбук ${loreCount}` : spec;
+  renderPassport();
+  renderEditor();
+  window.scrollTo({ top: 0 });
 }
 
-/**
- * Updates original and translated statistics
- */
-function updateCardStats() {
-  if (!state.originalCard || !state.translatedCard) return;
-
-  const origStats = calculateCardStats(state.originalCard);
-  const transStats = calculateCardStats(state.translatedCard);
-
-  elements.statOrigTokens.textContent = `Оригинал: ~${origStats.estimatedTokens} токенов (${origStats.chars} симв.)`;
-  elements.statTransTokens.textContent = `Перевод: ~${transStats.estimatedTokens} токенов (${transStats.chars} симв.)`;
+function closeWorkspace() {
+  state.originalCard = null;
+  state.translatedCard = null;
+  state.passport = null;
+  state.failed = {};
+  state.source = null;
+  state.rows = [];
+  el.workspaceView.hidden = true;
+  el.welcomeView.hidden = false;
+  el.editorRows.replaceChildren();
+  el.fieldNav.replaceChildren();
+  showDraftOffer();
 }
 
-/**
- * Renders both original and editable translated columns
- */
-function renderFields() {
-  elements.origFieldsContainer.innerHTML = '';
-  elements.transFieldsContainer.innerHTML = '';
-
-  const origData = state.originalCard.data;
-  const transData = state.translatedCard.data;
-
-  // Render Standard Translatable Fields
-  TRANSLATABLE_FIELDS.forEach(fieldDef => {
-    const origVal = origData[fieldDef.key] || '';
-    const transVal = transData[fieldDef.key] || '';
-
-    // Left Column: Original (Read-only)
-    const origBox = document.createElement('div');
-    origBox.className = 'field-box';
-    const origStats = countStats(origVal);
-    origBox.innerHTML = `
-      <div class="field-header">
-        <span class="field-label">${fieldDef.label}</span>
-        <button class="btn btn-secondary btn-sm" data-action="copy-orig" data-key="${fieldDef.key}" title="Скопировать исходный текст">
-          📋 Копировать
-        </button>
-      </div>
-      <div class="field-readonly" id="orig-val-${fieldDef.key}">${escapeHtml(origVal) || '<em style="color: var(--text-dim)">(пусто)</em>'}</div>
-      <div class="field-footer">
-        <span>Символов: ${origStats.chars}</span>
-        <span>~${origStats.estimatedTokens} токенов</span>
-      </div>
-    `;
-    elements.origFieldsContainer.appendChild(origBox);
-
-    // Right Column: Translated (Editable)
-    const transBox = document.createElement('div');
-    transBox.className = 'field-box';
-    const transStats = countStats(transVal);
-
-    const inputHtml = fieldDef.type === 'textarea'
-      ? `<textarea class="field-textarea" id="trans-input-${fieldDef.key}" rows="${fieldDef.rows}">${escapeHtml(transVal)}</textarea>`
-      : `<input type="text" class="field-input" id="trans-input-${fieldDef.key}" value="${escapeHtml(transVal)}">`;
-
-    transBox.innerHTML = `
-      <div class="field-header">
-        <span class="field-label">${fieldDef.label}</span>
-        <div class="field-actions">
-          <button class="btn btn-accent btn-sm" data-action="translate-field" data-key="${fieldDef.key}" title="Перевести это поле с помощью нейросети">
-            🌐 Перевести
-          </button>
-          <button class="btn btn-secondary btn-sm" data-action="copy-from-orig" data-key="${fieldDef.key}" title="Скопировать из оригинала">
-            Копировать оригинал
-          </button>
-          <button class="btn btn-icon" data-action="clear-field" data-key="${fieldDef.key}" title="Очистить поле">
-            🧹
-          </button>
-        </div>
-      </div>
-      ${inputHtml}
-      <div class="field-footer">
-        <span id="trans-stat-${fieldDef.key}">Символов: ${transStats.chars} (~${transStats.estimatedTokens} токенов)</span>
-        <span style="color: var(--text-dim);">${fieldDef.description}</span>
-      </div>
-    `;
-    elements.transFieldsContainer.appendChild(transBox);
-
-    // Event listener on right input for real-time state update
-    const inputElem = transBox.querySelector(`#trans-input-${fieldDef.key}`);
-    inputElem.addEventListener('input', (e) => {
-      state.translatedCard.data[fieldDef.key] = e.target.value;
-      if (fieldDef.key === 'name') {
-        elements.bannerCharName.textContent = e.target.value || state.originalCard.data.name;
-      }
-      const newStats = countStats(e.target.value);
-      const statSpan = transBox.querySelector(`#trans-stat-${fieldDef.key}`);
-      if (statSpan) {
-        statSpan.textContent = `Символов: ${newStats.chars} (~${newStats.estimatedTokens} токенов)`;
-      }
-      updateCardStats();
-    });
-  });
-
-  // Render Alternate Greetings
-  renderAlternateGreetings(origData.alternate_greetings || [], transData.alternate_greetings || []);
-
-  // Render Tags
-  renderTagsField(origData.tags || [], transData.tags || []);
-
-  // Render Lorebook / Character Book
-  if (origData.character_book) {
-    renderLorebook(origData.character_book, transData.character_book);
-  }
-}
-
-/**
- * Renders Character Book (Lorebook) entries if present
- */
-function renderLorebook(origBook, transBook) {
-  if (!origBook || !Array.isArray(origBook.entries) || origBook.entries.length === 0) return;
-
-  // Left: Original lorebook
-  const origBox = document.createElement('div');
-  origBox.className = 'field-box';
-  let origEntriesHtml = '';
-  origBook.entries.forEach((entry, idx) => {
-    if (!entry) return;
-    const keysStr = Array.isArray(entry.keys) ? entry.keys.join(', ') : (entry.keys || '');
-    origEntriesHtml += `
-      <div class="greeting-item" style="margin-bottom: 12px;">
-        <div style="font-size: 0.75rem; color: var(--text-dim); font-weight: 600; display:flex; justify-content:space-between; margin-bottom: 4px;">
-          <span>Запись #${idx + 1}: ${escapeHtml(entry.comment || 'Без названия')}</span>
-          <span style="color: #a5b4fc;">Ключи: ${escapeHtml(keysStr)}</span>
-        </div>
-        <div class="field-readonly" style="max-height: 140px; overflow-y: auto;">${escapeHtml(entry.content || '')}</div>
-      </div>
-    `;
-  });
-
-  origBox.innerHTML = `
-    <div class="field-header">
-      <span class="field-label">Лорбук / База знаний (${escapeHtml(origBook.name || 'Lorebook')}, записей: ${origBook.entries.length})</span>
-      <button class="btn btn-secondary btn-sm" data-action="copy-orig" data-key="lorebook_all" title="Скопировать весь лорбук">📋 Копировать</button>
-    </div>
-    <div class="greetings-list">${origEntriesHtml}</div>
-  `;
-  elements.origFieldsContainer.appendChild(origBox);
-
-  // Right: Translated lorebook
-  const transBox = document.createElement('div');
-  transBox.className = 'field-box';
-  let transEntriesHtml = '';
-  const transEntries = (transBook && Array.isArray(transBook.entries)) ? transBook.entries : [];
-  
-  transEntries.forEach((entry, idx) => {
-    if (!entry) return;
-    const keysStr = Array.isArray(entry.keys) ? entry.keys.join(', ') : (entry.keys || '');
-    transEntriesHtml += `
-      <div class="greeting-item" style="margin-bottom: 12px;" data-lore-idx="${idx}">
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 6px;">
-          <span style="font-size: 0.8rem; font-weight: 600; color: #a5b4fc;">Запись #${idx + 1}: ${escapeHtml(entry.comment || '')}</span>
-          <div class="field-actions">
-            <button class="btn btn-secondary btn-sm" data-action="copy-orig-lore-entry" data-idx="${idx}" type="button">Копировать из оригинала</button>
-            <button class="btn btn-danger btn-sm" data-action="remove-lore-entry" data-idx="${idx}" type="button">Удалить</button>
-          </div>
-        </div>
-        <div style="margin-bottom: 6px;">
-          <label style="font-size: 0.75rem; color: var(--text-dim); display:block; margin-bottom: 2px;">Ключи активации (через запятую):</label>
-          <input type="text" class="field-input" data-lore-keys-idx="${idx}" value="${escapeHtml(keysStr)}">
-        </div>
-        <div>
-          <label style="font-size: 0.75rem; color: var(--text-dim); display:block; margin-bottom: 2px;">Содержание записи:</label>
-          <textarea class="field-textarea" data-lore-content-idx="${idx}" rows="4">${escapeHtml(entry.content || '')}</textarea>
-        </div>
-      </div>
-    `;
-  });
-
-  transBox.innerHTML = `
-    <div class="field-header">
-      <span class="field-label">Лорбук / База знаний (${escapeHtml((transBook && transBook.name) || origBook.name || 'Lorebook')})</span>
-      <div class="field-actions">
-        <button class="btn btn-secondary btn-sm" id="btn-add-lore-entry" type="button">+ Добавить запись</button>
-      </div>
-    </div>
-    <div class="greetings-list" id="trans-lorebook-list">${transEntriesHtml}</div>
-  `;
-  elements.transFieldsContainer.appendChild(transBox);
-
-  const addLoreBtn = transBox.querySelector('#btn-add-lore-entry');
-  if (addLoreBtn) {
-    addLoreBtn.addEventListener('click', () => {
-      if (!state.translatedCard.data.character_book) {
-        state.translatedCard.data.character_book = { name: 'Lorebook', description: '', entries: [] };
-      }
-      if (!Array.isArray(state.translatedCard.data.character_book.entries)) {
-        state.translatedCard.data.character_book.entries = [];
-      }
-      state.translatedCard.data.character_book.entries.push({
-        keys: [],
-        content: '',
-        comment: `Запись #${state.translatedCard.data.character_book.entries.length + 1}`,
-        enabled: true
-      });
-      renderFields();
-      updateCardStats();
-      showToast('Добавлена новая запись в лорбук.', 'info', 2000);
-    });
-  }
-
-  // Event listeners for translated lorebook inputs
-  transBox.querySelectorAll('[data-lore-keys-idx]').forEach(input => {
-    input.addEventListener('input', (e) => {
-      const idx = parseInt(e.target.getAttribute('data-lore-keys-idx'), 10);
-      if (state.translatedCard?.data?.character_book?.entries?.[idx]) {
-        state.translatedCard.data.character_book.entries[idx].keys = e.target.value.split(/[\n,;]+/).map(k => k.trim()).filter(Boolean);
-      }
-    });
-  });
-
-  transBox.querySelectorAll('[data-lore-content-idx]').forEach(textarea => {
-    textarea.addEventListener('input', (e) => {
-      const idx = parseInt(e.target.getAttribute('data-lore-content-idx'), 10);
-      if (state.translatedCard?.data?.character_book?.entries?.[idx]) {
-        state.translatedCard.data.character_book.entries[idx].content = e.target.value;
-        updateCardStats();
-      }
-    });
-  });
-}
-
-/**
- * Renders Alternate Greetings list
- */
-function renderAlternateGreetings(origGreetings, transGreetings) {
-  // Left side: original alternate greetings
-  const origBox = document.createElement('div');
-  origBox.className = 'field-box';
-  let origGreetingsHtml = '';
-  if (origGreetings.length === 0) {
-    origGreetingsHtml = '<div class="field-readonly"><em style="color: var(--text-dim)">Нет альтернативных приветствий</em></div>';
-  } else {
-    origGreetings.forEach((g, idx) => {
-      origGreetingsHtml += `
-        <div class="greeting-item">
-          <div style="font-size: 0.75rem; color: var(--text-dim); font-weight: 600;">Приветствие #${idx + 1}</div>
-          <div class="field-readonly">${escapeHtml(g)}</div>
-        </div>
-      `;
-    });
-  }
-
-  origBox.innerHTML = `
-    <div class="field-header">
-      <span class="field-label">Альтернативные приветствия (${origGreetings.length})</span>
-    </div>
-    <div class="greetings-list">${origGreetingsHtml}</div>
-  `;
-  elements.origFieldsContainer.appendChild(origBox);
-
-  // Right side: translated alternate greetings
-  const transBox = document.createElement('div');
-  transBox.className = 'field-box';
-  
-  transBox.innerHTML = `
-    <div class="field-header">
-      <span class="field-label">Альтернативные приветствия (${transGreetings.length})</span>
-      <div class="field-actions">
-        <button class="btn btn-secondary btn-sm" id="btn-add-alt-greeting">+ Добавить приветствие</button>
-      </div>
-    </div>
-    <div class="greetings-list" id="trans-alt-greetings-list"></div>
-  `;
-  elements.transFieldsContainer.appendChild(transBox);
-
-  const listContainer = transBox.querySelector('#trans-alt-greetings-list');
-  renderTransGreetingsItems(listContainer);
-
-  transBox.querySelector('#btn-add-alt-greeting').addEventListener('click', () => {
-    state.translatedCard.data.alternate_greetings.push('');
-    renderTransGreetingsItems(listContainer);
-    updateCardStats();
-  });
-}
-
-function renderTransGreetingsItems(container) {
-  container.innerHTML = '';
-  const greetings = state.translatedCard.data.alternate_greetings || [];
-
-  if (greetings.length === 0) {
-    container.innerHTML = '<div style="color: var(--text-dim); font-size: 0.85rem;">Список пуст. Нажмите «Добавить приветствие» или скопируйте из оригинала.</div>';
-    return;
-  }
-
-  greetings.forEach((g, idx) => {
-    const item = document.createElement('div');
-    item.className = 'greeting-item';
-    const origG = (state.originalCard.data.alternate_greetings || [])[idx] || '';
-
-    item.innerHTML = `
-      <div style="display: flex; justify-content: space-between; align-items: center;">
-        <span style="font-size: 0.8rem; font-weight: 600; color: #a5b4fc;">Приветствие #${idx + 1}</span>
-        <div class="field-actions">
-          <button class="btn btn-accent btn-sm" data-action="translate-alt-greeting" data-idx="${idx}" title="Перевести нейросетью">
-            🌐 Перевести
-          </button>
-          <button class="btn btn-secondary btn-sm" data-action="copy-orig-greeting" data-idx="${idx}" title="Вставить из оригинала">
-            Копировать оригинал
-          </button>
-          <button class="btn btn-danger btn-sm" data-action="remove-alt-greeting" data-idx="${idx}" title="Удалить">
-            Удалить
-          </button>
-        </div>
-      </div>
-      <textarea class="field-textarea" data-idx="${idx}" rows="5">${escapeHtml(g)}</textarea>
-    `;
-
-    // Event listener for greeting text edit
-    const textarea = item.querySelector('textarea');
-    textarea.addEventListener('input', (e) => {
-      state.translatedCard.data.alternate_greetings[idx] = e.target.value;
-      updateCardStats();
-    });
-
-    container.appendChild(item);
-  });
-}
-
-/**
- * Renders Tags Field
- */
-function renderTagsField(origTags, transTags) {
-  // Left: Original Tags
-  const origBox = document.createElement('div');
-  origBox.className = 'field-box';
-  const origTagsStr = Array.isArray(origTags) ? origTags.join(', ') : String(origTags);
-  origBox.innerHTML = `
-    <div class="field-header">
-      <span class="field-label">Теги (Tags)</span>
-      <button class="btn btn-secondary btn-sm" data-action="copy-orig" data-key="tags">📋 Копировать</button>
-    </div>
-    <div class="field-readonly">${escapeHtml(origTagsStr) || '<em style="color: var(--text-dim)">(нет тегов)</em>'}</div>
-  `;
-  elements.origFieldsContainer.appendChild(origBox);
-
-  // Right: Translated Tags
-  const transBox = document.createElement('div');
-  transBox.className = 'field-box';
-  const transTagsStr = Array.isArray(transTags) ? transTags.join(', ') : String(transTags);
-  transBox.innerHTML = `
-    <div class="field-header">
-      <span class="field-label">Теги (Tags, через запятую)</span>
-      <div class="field-actions">
-        <button class="btn btn-accent btn-sm" data-action="translate-tags">🌐 Перевести</button>
-        <button class="btn btn-secondary btn-sm" data-action="copy-orig-tags">Копировать оригинал</button>
-      </div>
-    </div>
-    <input type="text" class="field-input" id="trans-tags-input" value="${escapeHtml(transTagsStr)}">
-  `;
-  elements.transFieldsContainer.appendChild(transBox);
-
-  transBox.querySelector('#trans-tags-input').addEventListener('input', (e) => {
-    const raw = e.target.value;
-    state.translatedCard.data.tags = raw.split(',').map(t => t.trim()).filter(Boolean);
-  });
-}
-
-/**
- * Helper to escape HTML characters
- */
-function escapeHtml(str) {
-  if (!str) return '';
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/\x22/g, '&quot;')
-    .replace(/\x27/g, '&#039;');
-}
-
-/**
- * Translates a single field
- */
-async function handleTranslateField(fieldKey) {
-  if (state.isTranslating) {
-    showToast('Перевод уже выполняется, подождите или отмените его.', 'warning');
-    return;
-  }
-
-  const origText = state.originalCard.data[fieldKey];
-  if (!origText || !origText.trim()) {
-    showToast(`Поле «${fieldKey}» в оригинале пустое.`, 'warning');
-    return;
-  }
-
-  const fieldDef = TRANSLATABLE_FIELDS.find(f => f.key === fieldKey);
-  const fieldLabel = fieldDef ? fieldDef.label : fieldKey;
-
-  const btn = document.querySelector(`[data-action="translate-field"][data-key="${fieldKey}"]`);
-  if (btn) {
-    btn.disabled = true;
-    btn.innerHTML = '⏳ Переводим...';
-  }
-
-  state.isTranslating = true;
-  state.abortController = new AbortController();
-  appLog(`Одиночный перевод поля «${fieldLabel}» начат.`);
-
-  try {
-    const translated = await translateText({
-      text: origText,
-      fieldLabel,
-      charName: state.translatedCard.data.name || state.originalCard.data.name,
-      context: {
-        personality: state.originalCard.data.personality,
-        scenario: state.originalCard.data.scenario
-      },
-      passport: state.passport,
-      settings: state.settings,
-      signal: state.abortController.signal
-    });
-
-    state.translatedCard.data[fieldKey] = translated;
-    const inputElem = document.getElementById(`trans-input-${fieldKey}`);
-    if (inputElem) {
-      inputElem.value = translated;
-      if (fieldKey === 'name') {
-        elements.bannerCharName.textContent = translated;
-      }
-    }
-    const newStats = countStats(translated);
-    const statSpan = document.getElementById(`trans-stat-${fieldKey}`);
-    if (statSpan) {
-      statSpan.textContent = `Символов: ${newStats.chars} (~${newStats.estimatedTokens} токенов)`;
-    }
-    updateCardStats();
-    showToast(`Поле «${fieldLabel}» успешно переведено!`, 'success');
-    appLog(`Поле «${fieldLabel}» переведено (${translated.length} симв.).`, 'success');
-  } catch (err) {
-    showToast(err.message, 'error');
-    appLog(`Ошибка перевода поля «${fieldLabel}»: ${err.message}`, 'error');
-  } finally {
-    state.isTranslating = false;
-    state.abortController = null;
-    if (btn) {
-      btn.disabled = false;
-      btn.innerHTML = '🌐 Перевести';
-    }
-  }
-}
-
-/**
- * Translates single alternate greeting
- */
-async function handleTranslateAltGreeting(idx) {
-  if (state.isTranslating) {
-    showToast('Перевод уже выполняется, подождите или отмените его.', 'warning');
-    return;
-  }
-
-  const origText = (state.originalCard.data.alternate_greetings || [])[idx];
-  if (!origText || !origText.trim()) {
-    showToast('Исходное приветствие пустое', 'warning');
-    return;
-  }
-
-  const btn = document.querySelector(`[data-action="translate-alt-greeting"][data-idx="${idx}"]`);
-  if (btn) {
-    btn.disabled = true;
-    btn.innerHTML = '⏳...';
-  }
-
-  state.abortController = new AbortController();
-  state.isTranslating = true;
-  appLog(`Перевод альтернативного приветствия #${idx + 1} начат.`);
-
-  try {
-    const translated = await translateText({
-      text: origText,
-      fieldLabel: `Альтернативное приветствие #${idx + 1}`,
-      charName: state.translatedCard.data.name || state.originalCard.data.name,
-      context: {
-        personality: state.originalCard.data.personality,
-        scenario: state.originalCard.data.scenario
-      },
-      passport: state.passport,
-      settings: state.settings,
-      signal: state.abortController.signal
-    });
-
-    state.translatedCard.data.alternate_greetings[idx] = translated;
-    const textarea = document.querySelector(`.greeting-item textarea[data-idx="${idx}"]`);
-    if (textarea) textarea.value = translated;
-    updateCardStats();
-    showToast(`Приветствие #${idx + 1} переведено!`, 'success');
-    appLog(`Альтернативное приветствие #${idx + 1} переведено.`, 'success');
-  } catch (err) {
-    showToast(err.message, 'error');
-    appLog(`Ошибка перевода приветствия #${idx + 1}: ${err.message}`, 'error');
-  } finally {
-    state.isTranslating = false;
-    state.abortController = null;
-    if (btn) {
-      btn.disabled = false;
-      btn.innerHTML = '🌐 Перевести';
-    }
-  }
-}
-
-/**
- * Translates Tags
- */
-async function handleTranslateTags() {
-  if (state.isTranslating) {
-    showToast('Перевод уже выполняется, подождите или отмените его.', 'warning');
-    return;
-  }
-
-  const origTags = state.originalCard.data.tags || [];
-  const origText = Array.isArray(origTags) ? origTags.join(', ') : String(origTags);
-  if (!origText.trim()) {
-    showToast('Оригинальные теги пусты', 'warning');
-    return;
-  }
-
-  const btn = document.querySelector('[data-action="translate-tags"]');
-  if (btn) {
-    btn.disabled = true;
-    btn.innerHTML = '⏳...';
-  }
-
-  state.abortController = new AbortController();
-  state.isTranslating = true;
-  appLog('Перевод тегов начат.');
-
-  try {
-    const translated = await translateText({
-      text: origText,
-      fieldLabel: 'Список тегов через запятую',
-      charName: state.translatedCard.data.name || state.originalCard.data.name,
-      passport: state.passport,
-      settings: state.settings,
-      signal: state.abortController.signal
-    });
-
-    const parsedTags = translated.split(/[\n,;]+/).map(t => t.trim()).filter(Boolean);
-    state.translatedCard.data.tags = parsedTags;
-    const input = document.getElementById('trans-tags-input');
-    if (input) input.value = parsedTags.join(', ');
-    showToast('Теги успешно переведены!', 'success');
-    appLog(`Теги успешно переведены: ${parsedTags.join(', ')}`, 'success');
-  } catch (err) {
-    showToast(err.message, 'error');
-    appLog(`Ошибка перевода тегов: ${err.message}`, 'error');
-  } finally {
-    state.isTranslating = false;
-    state.abortController = null;
-    if (btn) {
-      btn.disabled = false;
-      btn.innerHTML = '🌐 Перевести';
-    }
-  }
-}
-
-/**
- * 2-Step Batch Translation of all card fields & lorebook
- * Step 1: Context & Glossary Pass
- * Step 2: Full Card XML Translation with Passport Injection
- */
-async function handleTranslateAll() {
-  if (state.isTranslating) return;
-  if (!state.originalCard) return;
-
-  state.isTranslating = true;
-  state.abortController = new AbortController();
-
-  elements.btnTranslateAll.style.display = 'none';
-  elements.btnCancelTranslation.style.display = 'inline-flex';
-  elements.btnCopyAllOrig.disabled = true;
-
-  // Initialize 2-step progress UI
-  elements.batchProgressContainer.style.display = 'flex';
-  elements.stepPill1.className = 'step-pill active';
-  elements.stepPill2.className = 'step-pill';
-  elements.batchProgressBar.style.width = '20%';
-  elements.batchProgressText.textContent = 'Шаг 1/2: Анализ характера, пола, тона и составление глоссария...';
-
-  showToast('Шаг 1/2: Анализируем карточку персонажа и формируем паспорт контекста...', 'info', 4000);
-  appLog(`Начат перевод карточки «${state.originalCard.data.name || 'Персонаж'}» (Провайдер: ${state.settings.provider}, Модель: ${state.settings.model}).`);
-
-  try {
-    // Step 1: Context & Glossary Pass
-    const passport = await analyzeCardContext({
-      cardData: state.originalCard.data,
-      settings: state.settings,
-      signal: state.abortController.signal
-    });
-
-    state.passport = passport;
-    renderPassport(passport);
-    appLog(`Шаг 1: Паспорт контекста готов: ${passport.character_name_ru} (${passport.gender}, глаголы: ${passport.verb_gender}, обращение: "${passport.user_pronoun}"). Терминов: ${Object.keys(passport.glossary || {}).length}.`, 'success');
-
-    // Update progress to Step 2
-    elements.stepPill1.className = 'step-pill completed';
-    elements.stepPill2.className = 'step-pill active';
-    elements.batchProgressBar.style.width = '50%';
-    elements.batchProgressText.textContent = `Шаг 2/2: Перевод всех полей и лорбука (${passport.character_name_ru || state.originalCard.data.name}, ${passport.verb_gender}, «${passport.user_pronoun}»)...`;
-
-    showToast(`Шаг 1 завершен: ${passport.character_name_ru || 'Персонаж'} (${passport.gender}, «${passport.user_pronoun}»). Переводим поля...`, 'info', 4000);
-
-    // Step 2: Execution Translation Pass (XML tags + Step 1 passport + chunked lorebook)
-    const translatedDict = await translateFullCard({
-      cardData: state.originalCard.data,
-      passport: state.passport,
-      settings: state.settings,
-      signal: state.abortController.signal,
-      onProgress: ({ percent, message }) => {
-        elements.batchProgressBar.style.width = `${percent}%`;
-        elements.batchProgressText.textContent = message;
-        appLog(message, 'info');
-      }
-    });
-
-    elements.batchProgressBar.style.width = '90%';
-
-    let updatedCount = 0;
-    for (const [key, val] of Object.entries(translatedDict)) {
-      if (val !== undefined && val !== null) {
-        if (key === 'alternate_greetings' && Array.isArray(val)) {
-          state.translatedCard.data.alternate_greetings = val;
-          updatedCount++;
-        } else if (key === 'tags' && Array.isArray(val)) {
-          state.translatedCard.data.tags = val;
-          updatedCount++;
-        } else if (key === 'character_book' && typeof val === 'object') {
-          state.translatedCard.data.character_book = val;
-          updatedCount++;
-        } else if (typeof val === 'string' && val.trim()) {
-          state.translatedCard.data[key] = val;
-          updatedCount++;
-        }
-      }
-    }
-
-    elements.stepPill2.className = 'step-pill completed';
-    elements.batchProgressBar.style.width = '100%';
-    elements.batchProgressText.textContent = 'Готово: Перевод успешно завершен!';
-
-    renderFields();
-    updateCardStats();
-    showToast(`Вся карточка успешно переведена! Обновлено ${updatedCount} полей по паспорту контекста.`, 'success', 8000);
-    appLog(`Шаг 2: Перевод карточки завершен! Обновлено ${updatedCount} полей.`, 'success');
-  } catch (err) {
-    if (err.name === 'AbortError' || err.message.includes('отменен')) {
-      showToast('Перевод был остановлен пользователем.', 'warning');
-      elements.batchProgressText.textContent = 'Перевод остановлен.';
-      appLog('Перевод остановлен пользователем.', 'warning');
-    } else {
-      showToast('Ошибка перевода: ' + err.message, 'error', 12000);
-      elements.batchProgressText.textContent = 'Ошибка: ' + err.message;
-      appLog('Ошибка перевода: ' + err.message, 'error');
-    }
-  } finally {
-    state.isTranslating = false;
-    state.abortController = null;
-    elements.btnTranslateAll.style.display = 'inline-flex';
-    elements.btnCancelTranslation.style.display = 'none';
-    elements.btnCopyAllOrig.disabled = false;
-    setTimeout(() => {
-      if (!state.isTranslating) {
-        elements.batchProgressContainer.style.display = 'none';
-      }
-    }, 2500);
-  }
-}
-
-/**
- * Downloads a Blob as a file to the user's computer
- */
-function triggerDownload(blob, filename) {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  setTimeout(() => {
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  }, 200);
-}
-
-/**
- * Export Translated PNG
- */
-function downloadTranslatedPNG() {
-  if (!state.translatedCard || !state.currentImageBytes) return;
-
-  try {
-    const cardData = serializeV2Card(state.translatedCard);
-    const pngBytes = embedCardInPNG(state.currentImageBytes, cardData);
-    const blob = new Blob([pngBytes], { type: 'image/png' });
-    const name = (state.translatedCard.data.name || state.originalFileName || 'character')
-      .replace(/[^a-zA-Z0-9а-яА-ЯёЁ_-]/g, '_');
-    triggerDownload(blob, `${name}_RU.png`);
-    showToast(`Переведенная карточка «${name}_RU.png» сохранена!`, 'success');
-    appLog(`Экспорт: сохранена переведенная карточка «${name}_RU.png» (${(blob.size / 1024).toFixed(1)} КБ).`, 'success');
-  } catch (err) {
-    showToast('Ошибка при сборке PNG: ' + err.message, 'error');
-    appLog('Ошибка при сборке PNG: ' + err.message, 'error');
-  }
-}
-
-/**
- * Export Translated JSON
- */
-function downloadTranslatedJSON() {
-  if (!state.translatedCard) return;
-
-  const cardData = serializeV2Card(state.translatedCard);
-  const jsonStr = JSON.stringify(cardData, null, 2);
-  const blob = new Blob([jsonStr], { type: 'application/json;charset=utf-8' });
-  const name = (state.translatedCard.data.name || state.originalFileName || 'character')
-    .replace(/[^a-zA-Z0-9а-яА-ЯёЁ_-]/g, '_');
-  triggerDownload(blob, `${name}_RU.json`);
-  showToast(`JSON перевода «${name}_RU.json» сохранен!`, 'success');
-  appLog(`Экспорт: сохранен JSON перевода «${name}_RU.json» (${(blob.size / 1024).toFixed(1)} КБ).`, 'success');
-}
-
-/**
- * Export Original PNG
- */
-function downloadOriginalPNG() {
-  if (!state.originalCard || !state.originalImageBytes) return;
-
-  try {
-    const cardData = serializeV2Card(state.originalCard);
-    const pngBytes = embedCardInPNG(state.originalImageBytes, cardData);
-    const blob = new Blob([pngBytes], { type: 'image/png' });
-    const name = (state.originalCard.data.name || state.originalFileName || 'character')
-      .replace(/[^a-zA-Z0-9а-яА-ЯёЁ_-]/g, '_');
-    triggerDownload(blob, `${name}_ORIGINAL.png`);
-    showToast(`Оригинальная карточка «${name}_ORIGINAL.png» сохранена!`, 'success');
-    appLog(`Экспорт: сохранена оригинальная карточка «${name}_ORIGINAL.png».`, 'info');
-  } catch (err) {
-    showToast('Ошибка при экспорте оригинала: ' + err.message, 'error');
-    appLog('Ошибка при экспорте оригинала: ' + err.message, 'error');
-  }
-}
-
-/**
- * Export Original JSON
- */
-function downloadOriginalJSON() {
-  if (!state.originalCard) return;
-
-  const cardData = serializeV2Card(state.originalCard);
-  const jsonStr = JSON.stringify(cardData, null, 2);
-  const blob = new Blob([jsonStr], { type: 'application/json;charset=utf-8' });
-  const name = (state.originalCard.data.name || state.originalFileName || 'character')
-    .replace(/[^a-zA-Z0-9а-яА-ЯёЁ_-]/g, '_');
-  triggerDownload(blob, `${name}_ORIGINAL.json`);
-  showToast(`Оригинальный JSON «${name}_ORIGINAL.json» сохранен!`, 'success');
-  appLog(`Экспорт: сохранен оригинальный JSON «${name}_ORIGINAL.json».`, 'info');
-}
-
-/**
- * Handles File Upload (PNG or JSON)
- */
 async function handleFileUpload(file) {
   if (!file) return;
+  if (state.busy) {
+    showToast('Дождитесь окончания перевода или остановите его.', 'warning');
+    return;
+  }
+  if (!(await confirmReplaceCurrent())) return;
 
-  const fileName = file.name;
-  const ext = fileName.split('.').pop().toLowerCase();
-  appLog(`Загрузка файла: ${fileName} (${(file.size / 1024).toFixed(1)} КБ)...`);
+  const ext = file.name.split('.').pop().toLowerCase();
+  appLog(`Загрузка файла: ${file.name} (${(file.size / 1024).toFixed(1)} КБ)...`);
 
-  if (ext === 'png') {
-    try {
-      const buffer = await file.arrayBuffer();
-      const bytes = new Uint8Array(buffer);
+  try {
+    if (ext === 'png' || file.type === 'image/png') {
+      const bytes = new Uint8Array(await file.arrayBuffer());
       const cardJson = extractCardFromPNG(bytes);
-      await loadCardIntoApp(cardJson, bytes, fileName);
-    } catch (err) {
-      showToast('Ошибка при чтении PNG: ' + err.message, 'error');
-      appLog('Ошибка при чтении PNG: ' + err.message, 'error');
+      await loadCardIntoApp(cardJson, { imageBytes: bytes, fileName: file.name, kind: 'png', rawBytes: bytes });
+    } else if (ext === 'json' || file.type === 'application/json') {
+      const cardJson = JSON.parse(await file.text());
+      await loadCardIntoApp(cardJson, { fileName: file.name, kind: 'json' });
+    } else {
+      showToast('Поддерживаются только PNG и JSON', 'warning');
+      appLog(`Неподдерживаемый формат файла: ${ext}`, 'warning');
     }
-  } else if (ext === 'json') {
-    try {
-      const text = await file.text();
-      const cardJson = JSON.parse(text);
-      await loadCardIntoApp(cardJson, null, fileName);
-    } catch (err) {
-      showToast('Ошибка парсинга JSON файла: ' + err.message, 'error');
-      appLog('Ошибка парсинга JSON файла: ' + err.message, 'error');
-    }
-  } else {
-    showToast('Поддерживаются только форматы PNG и JSON', 'warning');
-    appLog(`Неподдерживаемый формат файла: ${ext}`, 'warning');
+  } catch (err) {
+    showToast(`Не удалось открыть ${file.name}: ${err.message}`, 'error');
+    appLog(`Ошибка при открытии ${file.name}: ${err.message}`, 'error');
   }
 }
 
-/**
- * Handles Avatar Replacement
- */
 async function handleAvatarUpload(file) {
   if (!file) return;
-
   try {
-    const pngBytes = await convertImageFileToPNGBytes(file);
-    state.currentImageBytes = pngBytes;
-    if (state.avatarUrl) URL.revokeObjectURL(state.avatarUrl);
-    const blob = new Blob([pngBytes], { type: 'image/png' });
-    state.avatarUrl = URL.createObjectURL(blob);
-    elements.charAvatar.src = state.avatarUrl;
-    showToast('Аватар персонажа успешно обновлен!', 'success');
-    appLog(`Аватар персонажа обновлен (${(file.size / 1024).toFixed(1)} КБ).`, 'info');
+    state.currentImageBytes = await convertImageFileToPNGBytes(file);
+    setAvatar(state.currentImageBytes);
+    scheduleSave();
+    showToast('Аватар обновлён — он попадёт в скачанный PNG перевода', 'success');
+    appLog(`Аватар персонажа обновлён (${(file.size / 1024).toFixed(1)} КБ).`);
   } catch (err) {
     showToast('Ошибка при смене аватара: ' + err.message, 'error');
     appLog('Ошибка при смене аватара: ' + err.message, 'error');
   }
 }
 
-/**
- * Settings Modal Logic
- */
-function updateSettingsModalUI() {
-  const s = state.settings;
-  elements.settingProvider.value = s.provider;
-  elements.settingApiKey.value = s.apiKey || '';
-  elements.settingBaseUrl.value = s.baseUrl;
-  elements.settingSystemPrompt.value = s.systemPrompt || DEFAULT_PROMPT_RU;
-  elements.settingTemperature.value = s.temperature;
-  elements.settingMaxTokens.value = s.maxTokens;
+// ---------------------------------------------------------------------------
+// Translation
+// ---------------------------------------------------------------------------
 
-  // Header status indicator
-  const pDef = PROVIDER_PRESETS[s.provider] || { name: s.provider };
-  elements.headerProviderName.textContent = pDef.name;
-  elements.headerModelName.textContent = s.model || 'не выбрана';
-
-  // Provider specific details
-  updateProviderView(s.provider);
+function setBusy(busy) {
+  state.busy = busy;
+  el.btnTranslateAll.hidden = busy;
+  el.btnCancelTranslation.hidden = !busy;
+  el.btnReanalyzePassport.disabled = busy;
+  if (!busy) state.busyIds.clear();
+  refreshAllRows();
 }
 
-function updateProviderView(providerId) {
-  const preset = PROVIDER_PRESETS[providerId] || PROVIDER_PRESETS.openrouter;
-  elements.providerHint.textContent = preset.hint;
+function setStep(pill, status) {
+  pill.className = `step-pill ${status || ''}`.trim();
+}
 
-  if (preset.needsKey) {
-    elements.groupApiKey.style.display = 'flex';
-  } else {
-    elements.groupApiKey.style.display = 'flex'; // allow key for custom endpoints too
+function showProgress({ text, percent = null, detail = '' }) {
+  el.progressPanel.hidden = false;
+  if (text !== undefined) el.progressText.textContent = text;
+  el.progressDetail.textContent = detail;
+  el.progressBar.classList.toggle('indeterminate', percent === null);
+  if (percent !== null) el.progressBar.style.width = `${Math.max(2, Math.min(100, percent))}%`;
+}
+
+function hideProgressLater() {
+  setTimeout(() => {
+    if (!state.busy) el.progressPanel.hidden = true;
+  }, 4000);
+}
+
+async function ensurePassport(signal) {
+  if (state.passport) {
+    setStep(el.stepPill1, 'skipped');
+    el.stepPill1.textContent = '1 · Паспорт (текущий)';
+    return;
   }
+  el.stepPill1.textContent = '1 · Паспорт';
+  setStep(el.stepPill1, 'active');
+  setStep(el.stepPill2, '');
+  showProgress({ text: 'Анализ персонажа: пол, обращение, тон, глоссарий...' });
 
-  // Model list
-  elements.settingModelSelect.innerHTML = '';
-  if (preset.popularModels && preset.popularModels.length > 0) {
-    preset.popularModels.forEach(m => {
-      const opt = document.createElement('option');
-      opt.value = m.id;
-      opt.textContent = m.name;
-      elements.settingModelSelect.appendChild(opt);
-    });
-    const customOpt = document.createElement('option');
-    customOpt.value = '__custom__';
-    customOpt.textContent = '— Указать другую модель вручную —';
-    elements.settingModelSelect.appendChild(customOpt);
-  }
-
-  // Populate model custom field
-  elements.settingModelCustom.value = state.settings.model || preset.defaultModel;
-  if (preset.popularModels?.some(m => m.id === state.settings.model)) {
-    elements.settingModelSelect.value = state.settings.model;
+  const passport = await analyzeCardContext({
+    cardData: state.originalCard.data,
+    settings: state.settings,
+    signal,
+    onDelta: (text) => showProgress({ detail: `Получено ${text.length} символов` })
+  });
+  state.passport = passport;
+  renderPassport();
+  setStep(el.stepPill1, 'completed');
+  if (passport.failed) {
+    showToast('Не удалось составить паспорт персонажа — перевод продолжится без него. Можно заполнить паспорт вручную.', 'warning');
+    appLog('Шаг 1: анализ не удался, используется пустой паспорт.', 'warning');
   } else {
-    elements.settingModelSelect.value = '__custom__';
-  }
-
-  // Local CORS help banner
-  if (providerId === 'ollama') {
-    elements.localCorsHelp.style.display = 'block';
-    elements.corsHelpText.innerHTML = `Для доступа из браузера запустите Ollama с CORS:<br><code class="code-pill">set OLLAMA_ORIGINS=* &amp;&amp; ollama serve</code>`;
-  } else if (providerId === 'lmstudio') {
-    elements.localCorsHelp.style.display = 'block';
-    elements.corsHelpText.innerHTML = `В LM Studio перейдите во вкладку <strong>Developer / Local Server</strong>, нажмите <strong>Start Server</strong> и включите галочку <strong>Enable CORS</strong>.`;
-  } else {
-    elements.localCorsHelp.style.display = 'none';
+    appLog(`Шаг 1: паспорт готов — ${passport.character_name_ru} (${passport.gender}, «${passport.verb_gender}», обращение «${passport.user_pronoun}»), терминов: ${Object.keys(passport.glossary).length}.`, 'success');
   }
 }
 
 /**
- * Event Listeners Initialization
+ * Runs step 1 (if needed) and step 2 for the given units, updating rows live.
  */
-function initEvents() {
-  // Toggle Passport summary
-  if (elements.btnTogglePassport) {
-    elements.btnTogglePassport.addEventListener('click', () => {
-      const isHidden = elements.passportContent.style.display === 'none';
-      elements.passportContent.style.display = isHidden ? 'flex' : 'none';
-    });
-  }
-
-  // File inputs
-  elements.btnLoadFile.addEventListener('click', () => {
-    if (state.isTranslating) {
-      showToast('Загрузка файла заблокирована во время перевода.', 'warning');
-      return;
-    }
-    elements.fileInput.click();
+async function runTranslation(units, { title = 'Перевод' } = {}) {
+  if (state.busy || !units.length) return;
+  state.abortController = new AbortController();
+  const { signal } = state.abortController;
+  units.forEach(u => {
+    state.busyIds.add(u.id);
+    delete state.failed[u.id];
   });
-  elements.btnBrowseCard.addEventListener('click', () => {
-    if (state.isTranslating) {
-      showToast('Загрузка файла заблокирована во время перевода.', 'warning');
-      return;
-    }
-    elements.fileInput.click();
-  });
-  elements.fileInput.addEventListener('change', (e) => {
-    if (e.target.files?.[0]) handleFileUpload(e.target.files[0]);
-    e.target.value = '';
-  });
+  setBusy(true);
+  appLog(`${title}: ${units.length} фрагм. (${PROVIDER_PRESETS[state.settings.provider]?.name || state.settings.provider}, ${state.settings.model}).`);
 
-  // Demo card
-  elements.btnLoadDemo.addEventListener('click', () => {
-    if (state.isTranslating) {
-      showToast('Загрузка карточки заблокирована во время перевода.', 'warning');
-      return;
-    }
-    loadCardIntoApp(DEMO_CARD, null, 'Seraphina_Vale');
-  });
+  try {
+    await ensurePassport(signal);
 
-  // Avatar change
-  elements.avatarContainer.addEventListener('click', () => {
-    if (state.isTranslating) {
-      showToast('Смена аватара заблокирована во время перевода.', 'warning');
-      return;
-    }
-    elements.avatarInput.click();
-  });
-  elements.avatarInput.addEventListener('change', (e) => {
-    if (e.target.files?.[0]) handleAvatarUpload(e.target.files[0]);
-    e.target.value = '';
-  });
+    setStep(el.stepPill2, 'active');
+    showProgress({ text: 'Перевод...', percent: 0 });
 
-  // Batch Translation Actions
-  elements.btnTranslateAll.addEventListener('click', handleTranslateAll);
-  elements.btnCancelTranslation.addEventListener('click', () => {
-    if (state.abortController) {
-      state.abortController.abort();
-    }
-  });
-
-  // Copy All Original to Translation
-  elements.btnCopyAllOrig.addEventListener('click', () => {
-    if (state.isTranslating) {
-      showToast('Копирование оригинала заблокировано во время перевода.', 'warning');
-      return;
-    }
-    if (!state.originalCard) return;
-    if (confirm('Скопировать все оригинальные поля в колонку перевода? Текущие правки будут перезаписаны.')) {
-      state.translatedCard = cloneCard(state.originalCard);
-      renderFields();
-      updateCardStats();
-      showToast('Все поля скопированы из оригинала.', 'info');
-    }
-  });
-
-  // Export Buttons
-  elements.btnDownloadTransPng.addEventListener('click', downloadTranslatedPNG);
-  elements.btnDownloadTransJson.addEventListener('click', downloadTranslatedJSON);
-  elements.btnDownloadOrigPng.addEventListener('click', downloadOriginalPNG);
-  elements.btnDownloadOrigJson.addEventListener('click', downloadOriginalJSON);
-
-  // Column Action Delegation (Copy orig, translate field, clear)
-  document.addEventListener('click', (e) => {
-    const target = e.target.closest('button');
-    if (!target) return;
-
-    const action = target.getAttribute('data-action');
-    const key = target.getAttribute('data-key');
-    const idx = target.getAttribute('data-idx');
-
-    if (state.isTranslating) {
-      if (action === 'copy-from-orig' || action === 'copy-orig-greeting' || action === 'copy-orig-tags' || action === 'copy-orig-lore-entry' || action === 'clear-field' || action === 'remove-alt-greeting' || action?.startsWith('translate-')) {
-        showToast('Действие заблокировано во время выполнения перевода.', 'warning');
-        return;
-      }
-    }
-
-    if (action === 'copy-orig' && key) {
-      const val = state.originalCard.data[key];
-      navigator.clipboard.writeText(val || '');
-      showToast(`Поле «${key}» скопировано в буфер!`, 'info', 2000);
-    } else if (action === 'copy-from-orig' && key) {
-      const val = state.originalCard.data[key];
-      state.translatedCard.data[key] = val;
-      const input = document.getElementById(`trans-input-${key}`);
-      if (input) input.value = val;
-      if (key === 'name') elements.bannerCharName.textContent = val;
-      updateCardStats();
-      showToast(`Скопировано из оригинала`, 'info', 1500);
-    } else if (action === 'clear-field' && key) {
-      state.translatedCard.data[key] = '';
-      const input = document.getElementById(`trans-input-${key}`);
-      if (input) input.value = '';
-      if (key === 'name') elements.bannerCharName.textContent = '';
-      updateCardStats();
-    } else if (action === 'translate-field' && key) {
-      handleTranslateField(key);
-    } else if (action === 'translate-alt-greeting' && idx !== null) {
-      handleTranslateAltGreeting(parseInt(idx, 10));
-    } else if (action === 'copy-orig-greeting' && idx !== null) {
-      const origG = (state.originalCard.data.alternate_greetings || [])[parseInt(idx, 10)] || '';
-      state.translatedCard.data.alternate_greetings[parseInt(idx, 10)] = origG;
-      const textarea = document.querySelector(`.greeting-item textarea[data-idx="${idx}"]`);
-      if (textarea) textarea.value = origG;
-      updateCardStats();
-      showToast('Приветствие скопировано из оригинала', 'info', 1500);
-    } else if (action === 'remove-alt-greeting' && idx !== null) {
-      state.translatedCard.data.alternate_greetings.splice(parseInt(idx, 10), 1);
-      const container = document.getElementById('trans-alt-greetings-list');
-      renderTransGreetingsItems(container);
-      updateCardStats();
-    } else if (action === 'translate-tags') {
-      handleTranslateTags();
-    } else if (action === 'copy-orig-tags') {
-      const origTags = state.originalCard.data.tags || [];
-      state.translatedCard.data.tags = [...origTags];
-      const input = document.getElementById('trans-tags-input');
-      if (input) input.value = origTags.join(', ');
-      showToast('Теги скопированы из оригинала', 'info', 1500);
-    } else if (action === 'copy-orig-lore-entry' && idx !== null) {
-      const i = parseInt(idx, 10);
-      const origEntry = state.originalCard.data.character_book?.entries?.[i];
-      if (origEntry && state.translatedCard?.data?.character_book?.entries?.[i]) {
-        state.translatedCard.data.character_book.entries[i] = JSON.parse(JSON.stringify(origEntry));
-        renderFields();
-        updateCardStats();
-        showToast(`Запись лорбука #${i + 1} скопирована из оригинала`, 'info', 1500);
-      }
-    } else if (action === 'remove-lore-entry' && idx !== null) {
-      const i = parseInt(idx, 10);
-      if (state.translatedCard?.data?.character_book?.entries?.[i] !== undefined) {
-        state.translatedCard.data.character_book.entries.splice(i, 1);
-        renderFields();
-        updateCardStats();
-        showToast(`Запись #${i + 1} удалена из лорбука.`, 'info', 1500);
-      }
-    } else if (action === 'copy-orig' && key === 'lorebook_all') {
-      const origBook = state.originalCard.data.character_book;
-      if (origBook) {
-        navigator.clipboard.writeText(JSON.stringify(origBook, null, 2));
-        showToast('Лорбук скопирован в буфер в формате JSON!', 'info', 2000);
-      }
-    }
-  });
-
-  // Drag and Drop (Global Window)
-  window.addEventListener('dragenter', (e) => {
-    e.preventDefault();
-    if (!state.isTranslating) {
-      elements.dragOverlay.classList.add('active');
-    }
-  });
-
-  elements.dragOverlay.addEventListener('dragleave', (e) => {
-    e.preventDefault();
-    if (e.relatedTarget === null) {
-      elements.dragOverlay.classList.remove('active');
-    }
-  });
-
-  window.addEventListener('dragover', (e) => e.preventDefault());
-
-  window.addEventListener('drop', (e) => {
-    e.preventDefault();
-    elements.dragOverlay.classList.remove('active');
-    if (state.isTranslating) {
-      showToast('Загрузка файла заблокирована во время выполнения перевода.', 'warning');
-      return;
-    }
-    if (e.dataTransfer.files?.[0]) {
-      handleFileUpload(e.dataTransfer.files[0]);
-    }
-  });
-
-  // Settings Modal Controls
-  elements.btnOpenSettings.addEventListener('click', () => {
-    updateSettingsModalUI();
-    elements.settingsModal.classList.add('active');
-  });
-
-  const closeSettings = () => elements.settingsModal.classList.remove('active');
-  elements.btnCloseSettings.addEventListener('click', closeSettings);
-  elements.btnCancelSettings.addEventListener('click', closeSettings);
-
-  // Toggle API key password visibility
-  elements.btnToggleKeyVisibility.addEventListener('click', () => {
-    const isPass = elements.settingApiKey.type === 'password';
-    elements.settingApiKey.type = isPass ? 'text' : 'password';
-  });
-
-  // Provider changed in modal
-  elements.settingProvider.addEventListener('change', (e) => {
-    const pId = e.target.value;
-    const preset = PROVIDER_PRESETS[pId];
-    if (preset) {
-      elements.settingBaseUrl.value = preset.baseUrl;
-      updateProviderView(pId);
-    }
-  });
-
-  // Model select changed in modal
-  elements.settingModelSelect.addEventListener('change', (e) => {
-    if (e.target.value === '__custom__') {
-      elements.settingModelCustom.focus();
-    } else {
-      elements.settingModelCustom.value = e.target.value;
-    }
-  });
-
-  // Reset prompt to default
-  elements.btnResetPrompt.addEventListener('click', () => {
-    elements.settingSystemPrompt.value = DEFAULT_PROMPT_RU;
-  });
-
-  // Refresh models list from API
-  elements.btnRefreshModels.addEventListener('click', async () => {
-    const baseUrl = elements.settingBaseUrl.value.trim();
-    const apiKey = elements.settingApiKey.value.trim();
-    const provider = elements.settingProvider.value;
-
-    elements.btnRefreshModels.disabled = true;
-    elements.btnRefreshModels.innerHTML = '⏳ Загрузка...';
-
-    const abortCtrl = new AbortController();
-    const timerId = setTimeout(() => abortCtrl.abort(), 10000);
-
-    try {
-      const models = await fetchAvailableModels(baseUrl, apiKey, provider, abortCtrl.signal);
-      clearTimeout(timerId);
-
-      if (models.length === 0) {
-        showToast('Список моделей пуст или не поддерживается эндпоинтом', 'warning');
-      } else {
-        elements.settingModelSelect.innerHTML = '';
-        models.forEach(m => {
-          const opt = document.createElement('option');
-          opt.value = m.id;
-          opt.textContent = m.name || m.id;
-          elements.settingModelSelect.appendChild(opt);
+    const { results, failed } = await translateUnits({
+      units,
+      passport: state.passport,
+      settings: state.settings,
+      signal,
+      onProgress: ({ done, total, message, streamedChars }) => {
+        showProgress({
+          text: `${message} · готово ${done} из ${total}`,
+          percent: (done / total) * 100,
+          detail: streamedChars ? `Получено ${streamedChars} символов ответа` : ''
         });
-        const customOpt = document.createElement('option');
-        customOpt.value = '__custom__';
-        customOpt.textContent = '— Указать другую модель вручную —';
-        elements.settingModelSelect.appendChild(customOpt);
+      },
+      onUnitDone: (id, value) => {
+        applyTranslations(state.translatedCard.data, { [id]: value }, state.originalCard.data, state.passport, { inPlace: true });
+        state.busyIds.delete(id);
+        syncInputFromState(id);
+        const row = rowForPath(id);
+        if (row) updateRow(row);
+        updateSummary();
+        scheduleSave();
+      }
+    });
 
-        if (models[0]) {
-          elements.settingModelSelect.value = models[0].id;
-          elements.settingModelCustom.value = models[0].id;
+    for (const f of failed) state.failed[f.id] = f.reason;
+    const okCount = Object.keys(results).length;
+    setStep(el.stepPill2, failed.length ? '' : 'completed');
+
+    if (failed.length) {
+      showProgress({ text: `Переведено ${okCount} из ${units.length}, ошибок: ${failed.length}`, percent: (okCount / units.length) * 100 });
+      showToast(`Переведено ${okCount} из ${units.length}. Не удалось: ${failed.map(f => f.label).slice(0, 4).join(', ')}${failed.length > 4 ? '…' : ''}. Нажмите «Повторить неудавшиеся».`, 'warning', { duration: 10000 });
+      failed.forEach(f => appLog(`Не переведено «${f.label}»: ${f.reason}`, 'warning'));
+    } else {
+      showProgress({ text: `Готово: переведено ${okCount}`, percent: 100 });
+      showToast(units.length === 1 ? `«${units[0].label}» переведено` : `Перевод завершён: ${okCount} фрагм.`, 'success');
+    }
+    appLog(`${title}: готово ${okCount}/${units.length}.`, failed.length ? 'warning' : 'success');
+  } catch (err) {
+    if (err.name === 'AbortError' || signal.aborted) {
+      showProgress({ text: 'Перевод остановлен. Уже переведённые поля сохранены.' });
+      el.progressBar.classList.remove('indeterminate');
+      showToast('Перевод остановлен', 'warning');
+      appLog('Перевод остановлен пользователем.', 'warning');
+    } else {
+      showProgress({ text: `Ошибка: ${err.message}` });
+      el.progressBar.classList.remove('indeterminate');
+      showToast(err.message, 'error');
+      appLog(`Ошибка перевода: ${err.message}`, 'error');
+    }
+  } finally {
+    state.abortController = null;
+    setBusy(false);
+    scheduleSave();
+    hideProgressLater();
+  }
+}
+
+function allUnits() {
+  return buildTranslationUnits(state.originalCard.data, { translateTags: state.settings.translateTags });
+}
+
+function isUnitTranslated(unit) {
+  return getBound(state.translatedCard.data, unit.id) !== getBound(state.originalCard.data, unit.id);
+}
+
+async function handleTranslateAll() {
+  if (state.busy || !state.originalCard) return;
+  const units = allUnits();
+  if (!units.length) {
+    showToast('В карточке нечего переводить', 'warning');
+    return;
+  }
+  const pending = units.filter(u => !isUnitTranslated(u));
+  let selected = units;
+
+  if (pending.length < units.length) {
+    const choice = await askChoice(
+      'Часть карточки уже переведена',
+      pending.length
+        ? `Не переведено фрагментов: ${pending.length} из ${units.length}. «Всё заново» перезапишет и ручные правки.`
+        : 'Все фрагменты уже отличаются от оригинала. Перевести всё заново? Ручные правки будут перезаписаны.',
+      [
+        { label: 'Отмена', value: null },
+        { label: 'Всё заново', value: 'all', kind: 'btn-secondary' },
+        ...(pending.length ? [{ label: `Только непереведённые (${pending.length})`, value: 'pending', kind: 'btn-accent' }] : [])
+      ]
+    );
+    if (!choice) return;
+    selected = choice === 'pending' ? pending : units;
+  }
+
+  await runTranslation(selected, { title: 'Перевод карточки' });
+}
+
+async function handleTranslateRow(rowId) {
+  const row = findRow(rowId);
+  if (!row || state.busy) return;
+  const paths = new Set(row.binds.map(b => b.path));
+  const units = buildTranslationUnits(state.originalCard.data, { translateTags: true }).filter(u => paths.has(u.id));
+  if (!units.length) {
+    showToast('В оригинале это поле пустое', 'warning');
+    return;
+  }
+  await runTranslation(units, { title: `Перевод «${row.title}»` });
+}
+
+async function handleRetryFailed() {
+  if (state.busy) return;
+  const ids = new Set(Object.keys(state.failed));
+  const units = buildTranslationUnits(state.originalCard.data, { translateTags: true }).filter(u => ids.has(u.id));
+  if (!units.length) {
+    state.failed = {};
+    refreshAllRows();
+    return;
+  }
+  await runTranslation(units, { title: 'Повтор неудавшихся' });
+}
+
+function handleResetRow(rowId) {
+  const row = findRow(rowId);
+  if (!row) return;
+  const previous = row.binds.map(b => [b.path, getBound(state.translatedCard.data, b.path)]);
+  for (const b of row.binds) {
+    setBound(state.translatedCard.data, b.path, getBound(state.originalCard.data, b.path));
+    delete state.failed[b.path];
+    syncInputFromState(b.path);
+  }
+  updateRow(row);
+  updateSummary();
+  scheduleSave();
+  showToast(`«${row.title}» возвращено к оригиналу`, 'info', {
+    action: {
+      label: 'Отменить',
+      onClick: () => {
+        for (const [path, value] of previous) {
+          setBound(state.translatedCard.data, path, value);
+          syncInputFromState(path);
         }
-        showToast(`Успешно загружено ${models.length} моделей!`, 'success');
+        updateRow(row);
+        updateSummary();
+        scheduleSave();
       }
-    } catch (err) {
-      clearTimeout(timerId);
-      showToast(err.message, 'warning', 6000);
-    } finally {
-      clearTimeout(timerId);
-      elements.btnRefreshModels.disabled = false;
-      elements.btnRefreshModels.innerHTML = '🔄 Обновить список моделей';
     }
   });
+}
 
-  // Save Settings
-  elements.btnSaveSettings.addEventListener('click', () => {
-    const chosenModel = elements.settingModelCustom.value.trim() ||
-      (elements.settingModelSelect.value !== '__custom__' ? elements.settingModelSelect.value : '');
-
-    state.settings = {
-      provider: elements.settingProvider.value,
-      baseUrl: elements.settingBaseUrl.value.trim(),
-      apiKey: elements.settingApiKey.value.trim(),
-      model: chosenModel,
-      systemPrompt: elements.settingSystemPrompt.value.trim(),
-      temperature: parseFloat(elements.settingTemperature.value) || 0.3,
-      maxTokens: parseInt(elements.settingMaxTokens.value, 10) || 8192
-    };
-
-    saveSettings(state.settings);
-    updateSettingsModalUI();
-    closeSettings();
-    showToast('Настройки успешно сохранены!', 'success');
-  });
-
-  // Assistant Modal Controls
-  const openAssistantModal = () => {
-    if (!state.originalCard) {
-      showToast('Сначала откройте или загрузите карточку персонажа.', 'warning');
-      return;
+async function handleReanalyzePassport() {
+  if (state.busy || !state.originalCard) return;
+  const previous = state.passport;
+  state.passport = null;
+  state.abortController = new AbortController();
+  setBusy(true);
+  try {
+    await ensurePassport(state.abortController.signal);
+    showProgress({ text: 'Паспорт обновлён', percent: 100 });
+    scheduleSave();
+  } catch (err) {
+    state.passport = previous;
+    renderPassport();
+    if (err.name !== 'AbortError') {
+      showProgress({ text: `Ошибка: ${err.message}` });
+      showToast(err.message, 'error');
+      appLog(`Ошибка анализа: ${err.message}`, 'error');
     }
-    elements.assistantStatusText.textContent = 'Готов к работе';
-    elements.assistantModal.classList.add('active');
+  } finally {
+    el.progressBar.classList.remove('indeterminate');
+    state.abortController = null;
+    setBusy(false);
+    hideProgressLater();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Export
+// ---------------------------------------------------------------------------
+
+function triggerDownload(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = h('a', { href: url, download: filename });
+  document.body.append(a);
+  a.click();
+  setTimeout(() => {
+    a.remove();
+    URL.revokeObjectURL(url);
+  }, 500);
+}
+
+function exportBaseName(card) {
+  return safeFileName(card.data.name || state.source?.name?.replace(/\.[^.]+$/, ''));
+}
+
+function downloadTranslatedPNG() {
+  if (!state.translatedCard) return;
+  try {
+    const isV3 = state.originalCard.spec === 'chara_card_v3';
+    const pngBytes = embedCardInPNG(state.currentImageBytes, {
+      chara: toExportJson(state.translatedCard, 'chara_card_v2'),
+      ccv3: isV3 ? toExportJson(state.translatedCard, 'chara_card_v3') : null
+    });
+    const name = `${exportBaseName(state.translatedCard)}_RU.png`;
+    triggerDownload(new Blob([pngBytes], { type: 'image/png' }), name);
+    showToast(`Сохранено: ${name}`, 'success');
+    appLog(`Экспорт: ${name} (${(pngBytes.length / 1024).toFixed(1)} КБ).`, 'success');
+  } catch (err) {
+    showToast('Ошибка при сборке PNG: ' + err.message, 'error');
+    appLog('Ошибка при сборке PNG: ' + err.message, 'error');
+  }
+}
+
+function downloadTranslatedJSON() {
+  const json = JSON.stringify(toExportJson(state.translatedCard), null, 2);
+  const name = `${exportBaseName(state.translatedCard)}_RU.json`;
+  triggerDownload(new Blob([json], { type: 'application/json;charset=utf-8' }), name);
+  showToast(`Сохранено: ${name}`, 'success');
+  appLog(`Экспорт: ${name}.`, 'success');
+}
+
+async function downloadOriginalPNG() {
+  const src = state.source;
+  const base = exportBaseName(state.originalCard);
+  try {
+    let bytes;
+    if (src?.kind === 'png' && src.bytes) {
+      bytes = src.bytes; // the untouched file, byte for byte
+    } else {
+      const image = await createPlaceholderAvatar(state.originalCard.data.name);
+      bytes = embedCardInPNG(image, { chara: src?.rawJson || toExportJson(state.originalCard) });
+    }
+    triggerDownload(new Blob([bytes], { type: 'image/png' }), `${base}_ORIGINAL.png`);
+    appLog(`Экспорт оригинала: ${base}_ORIGINAL.png.`);
+  } catch (err) {
+    showToast('Ошибка при экспорте оригинала: ' + err.message, 'error');
+  }
+}
+
+function downloadOriginalJSON() {
+  const raw = state.source?.rawJson || toExportJson(state.originalCard);
+  const base = exportBaseName(state.originalCard);
+  triggerDownload(new Blob([JSON.stringify(raw, null, 2)], { type: 'application/json;charset=utf-8' }), `${base}_ORIGINAL.json`);
+  appLog(`Экспорт оригинала: ${base}_ORIGINAL.json.`);
+}
+
+async function handleMenuAction(action) {
+  el.exportMenu.open = false;
+  if (!state.originalCard) return;
+  if (action === 'trans-json') downloadTranslatedJSON();
+  else if (action === 'orig-png') downloadOriginalPNG();
+  else if (action === 'orig-json') downloadOriginalJSON();
+  else if (action === 'copy-all-orig') {
+    if (state.busy) return;
+    const ok = await askChoice('Сбросить перевод?', 'Все поля перевода станут равны оригиналу. Это нельзя отменить.', [
+      { label: 'Отмена', value: null },
+      { label: 'Сбросить', value: true, kind: 'btn-danger' }
+    ]);
+    if (!ok) return;
+    state.translatedCard = cloneCard(state.originalCard);
+    state.failed = {};
+    renderEditor();
+    scheduleSave();
+    showToast('Перевод сброшен к оригиналу', 'info');
+  } else if (action === 'close-card') {
+    if (state.busy) return;
+    const choice = await askChoice('Закрыть карточку?', 'Черновик будет удалён. Скачайте перевод, если он нужен.', [
+      { label: 'Отмена', value: null },
+      { label: 'Скачать и закрыть', value: 'download', kind: 'btn-success' },
+      { label: 'Закрыть', value: 'close', kind: 'btn-danger' }
+    ]);
+    if (!choice) return;
+    if (choice === 'download') downloadTranslatedPNG();
+    await clearDraft();
+    closeWorkspace();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
+function updateHeaderModel() {
+  const preset = PROVIDER_PRESETS[state.settings.provider];
+  el.headerProviderName.textContent = preset?.name || state.settings.provider;
+  el.headerModelName.textContent = state.settings.model || 'модель не выбрана';
+}
+
+function fillModelSelect(models, selectedId) {
+  const options = models.map(m => h('option', { value: m.id }, m.name || m.id));
+  options.push(h('option', { value: '__custom__' }, '— другая модель (введите справа) —'));
+  el.settingModelSelect.replaceChildren(...options);
+  el.settingModelSelect.value = models.some(m => m.id === selectedId) ? selectedId : '__custom__';
+}
+
+function updateProviderView(providerId, model) {
+  const preset = PROVIDER_PRESETS[providerId] || PROVIDER_PRESETS.custom;
+  el.providerHint.textContent = preset.hint;
+  fillModelSelect(preset.popularModels || [], model);
+  el.settingModelCustom.value = model || preset.defaultModel || '';
+
+  el.localCorsHelp.hidden = !['ollama', 'lmstudio'].includes(providerId);
+  el.corsHelpText.textContent = providerId === 'ollama'
+    ? 'Запустите Ollama с разрешённым CORS: set OLLAMA_ORIGINS=* && ollama serve'
+    : 'В LM Studio: вкладка Developer → Start Server → включите Enable CORS.';
+}
+
+function openSettings() {
+  const s = state.settings;
+  el.settingProvider.value = s.provider;
+  el.settingApiKey.value = s.apiKey || '';
+  el.settingApiKey.type = 'password';
+  el.settingBaseUrl.value = s.baseUrl;
+  el.settingTemperature.value = s.temperature;
+  el.settingMaxTokens.value = s.maxTokens;
+  el.settingStream.checked = s.stream !== false;
+  el.settingTranslateTags.checked = s.translateTags !== false;
+  el.settingExtraInstructions.value = s.extraInstructions || '';
+  updateProviderView(s.provider, s.model);
+  el.settingsModal.classList.add('active');
+}
+
+function closeSettings() {
+  el.settingsModal.classList.remove('active');
+}
+
+function saveSettingsFromForm() {
+  const selected = el.settingModelSelect.value;
+  const model = el.settingModelCustom.value.trim() || (selected !== '__custom__' ? selected : '');
+  const temperature = parseFloat(el.settingTemperature.value);
+  const maxTokens = parseInt(el.settingMaxTokens.value, 10);
+
+  state.settings = {
+    ...DEFAULT_SETTINGS,
+    provider: el.settingProvider.value,
+    baseUrl: el.settingBaseUrl.value.trim(),
+    apiKey: el.settingApiKey.value.trim(),
+    model,
+    temperature: Number.isFinite(temperature) ? temperature : DEFAULT_SETTINGS.temperature,
+    maxTokens: Number.isFinite(maxTokens) && maxTokens > 0 ? maxTokens : DEFAULT_SETTINGS.maxTokens,
+    stream: el.settingStream.checked,
+    translateTags: el.settingTranslateTags.checked,
+    extraInstructions: el.settingExtraInstructions.value.trim()
   };
+  saveSettings(state.settings);
+  updateHeaderModel();
+  closeSettings();
+  showToast('Настройки сохранены', 'success');
+}
 
-  const closeAssistantModal = () => {
-    elements.assistantModal.classList.remove('active');
+async function refreshModels() {
+  el.btnRefreshModels.disabled = true;
+  el.btnRefreshModels.textContent = 'Загрузка...';
+  const abortCtrl = new AbortController();
+  const timer = setTimeout(() => abortCtrl.abort(), 10000);
+  try {
+    const models = await fetchAvailableModels(
+      el.settingBaseUrl.value.trim(),
+      el.settingApiKey.value.trim(),
+      el.settingProvider.value,
+      abortCtrl.signal
+    );
+    if (!models.length) {
+      showToast('Эндпоинт вернул пустой список моделей', 'warning');
+      return;
+    }
+    const current = el.settingModelCustom.value.trim();
+    fillModelSelect(models, current);
+    if (el.settingModelSelect.value === '__custom__' && !current) {
+      el.settingModelSelect.value = models[0].id;
+      el.settingModelCustom.value = models[0].id;
+    }
+    showToast(`Загружено моделей: ${models.length}`, 'success');
+  } catch (err) {
+    showToast(err.message, 'warning', { duration: 8000 });
+  } finally {
+    clearTimeout(timer);
+    el.btnRefreshModels.disabled = false;
+    el.btnRefreshModels.textContent = '↻ Обновить список';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Assistant
+// ---------------------------------------------------------------------------
+
+function openAssistant() {
+  if (!state.originalCard) return;
+  el.assistantStatusText.textContent = 'Готов к работе';
+  el.assistantModal.classList.add('active');
+}
+
+function closeAssistant() {
+  state.assistantAbort?.abort();
+  el.assistantModal.classList.remove('active');
+}
+
+function switchAssistantTab(tab) {
+  const ask = tab === 'ask';
+  el.tabBtnAsk.classList.toggle('active', ask);
+  el.tabBtnTransform.classList.toggle('active', !ask);
+  el.paneAsk.hidden = !ask;
+  el.paneTransform.hidden = ask;
+}
+
+/**
+ * Wraps an assistant request: the button turns into "Остановить" while it runs.
+ */
+async function runAssistantTask(button, idleLabel, statusText, task) {
+  if (state.assistantAbort) {
+    state.assistantAbort.abort();
+    return;
+  }
+  const ctrl = new AbortController();
+  state.assistantAbort = ctrl;
+  button.textContent = '■ Остановить';
+  button.classList.add('btn-danger');
+  el.assistantStatusText.textContent = statusText;
+  try {
+    await task(ctrl.signal);
+  } catch (err) {
+    if (err.name === 'AbortError' || ctrl.signal.aborted) {
+      el.assistantStatusText.textContent = 'Остановлено';
+    } else {
+      el.assistantStatusText.textContent = 'Ошибка';
+      showToast(err.message, 'error');
+      appLog(`Ассистент: ${err.message}`, 'error');
+    }
+  } finally {
+    state.assistantAbort = null;
+    button.textContent = idleLabel;
+    button.classList.remove('btn-danger');
+  }
+}
+
+function handleAsk() {
+  const question = el.assistantQuestionInput.value.trim();
+  if (!question && !state.assistantAbort) {
+    showToast('Введите вопрос', 'warning');
+    return;
+  }
+  runAssistantTask(el.btnSendQuestion, 'Спросить', 'Модель анализирует карточку...', async (signal) => {
+    el.assistantAskResultBox.hidden = false;
+    el.assistantAskResultText.textContent = '';
+    const answer = await askCharacterAI({
+      cardData: state.translatedCard.data,
+      question,
+      settings: state.settings,
+      signal,
+      onDelta: (text) => { el.assistantAskResultText.textContent = text; }
+    });
+    el.assistantAskResultText.textContent = answer;
+    el.assistantStatusText.textContent = 'Ответ готов';
+    appLog(`Ассистент: ответ получен (${answer.length} симв.).`, 'success');
+  });
+}
+
+const TRANSFORM_LABELS = Object.fromEntries(TEXT_FIELDS.map(f => [f.key, f.label]));
+
+function handleTransform() {
+  const instruction = el.assistantTransformInput.value.trim();
+  if (!instruction && !state.assistantAbort) {
+    showToast('Опишите, что изменить', 'warning');
+    return;
+  }
+  const source = el.assistantSourceSelect.value === 'original' ? state.originalCard.data : state.translatedCard.data;
+  runAssistantTask(el.btnExecuteTransform, 'Выполнить', 'Модель перерабатывает карточку...', async (signal) => {
+    el.assistantTransformResultBox.hidden = true;
+    const result = await transformCharacterAI({
+      cardData: source,
+      instruction,
+      settings: state.settings,
+      signal,
+      onDelta: (text) => { el.assistantStatusText.textContent = `Получено ${text.length} символов...`; }
+    });
+    state.pendingTransform = result;
+    el.transformSummaryText.textContent = result.changesSummary;
+    el.transformDiffList.replaceChildren(...Object.entries(result.modifiedFields).map(([key, val]) =>
+      h('div', { className: 'diff-card' },
+        h('div', { className: 'diff-card-head' }, h('span', {}, TRANSFORM_LABELS[key] || key), h('span', {}, `${val.length} симв.`)),
+        h('div', { className: 'diff-card-text' }, val)
+      )
+    ));
+    el.assistantTransformResultBox.hidden = false;
+    el.assistantStatusText.textContent = 'Готово — проверьте и примените';
+    appLog(`Ассистент: трансформация готова (${Object.keys(result.modifiedFields).length} полей).`, 'success');
+  });
+}
+
+function applyTransform() {
+  const modified = state.pendingTransform?.modifiedFields;
+  if (!modified) return;
+  for (const [key, val] of Object.entries(modified)) {
+    state.translatedCard.data[key] = val;
+    syncInputFromState(`field:${key}`);
+  }
+  refreshAllRows();
+  scheduleSave();
+  closeAssistant();
+  state.pendingTransform = null;
+  el.assistantTransformResultBox.hidden = true;
+  showToast(`Применено полей: ${Object.keys(modified).length}`, 'success');
+  appLog(`Ассистент: изменения применены к ${Object.keys(modified).length} полям.`, 'success');
+}
+
+// ---------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------
+
+function initEvents() {
+  const pickFile = () => {
+    if (state.busy) {
+      showToast('Дождитесь окончания перевода или остановите его.', 'warning');
+      return;
+    }
+    el.fileInput.click();
   };
-
-  const switchAssistantTab = (targetTab) => {
-    if (targetTab === 'ask') {
-      elements.tabBtnAsk.classList.add('active');
-      elements.tabBtnTransform.classList.remove('active');
-      elements.paneAsk.style.display = 'flex';
-      elements.paneTransform.style.display = 'none';
-    } else if (targetTab === 'transform') {
-      elements.tabBtnTransform.classList.add('active');
-      elements.tabBtnAsk.classList.remove('active');
-      elements.paneTransform.style.display = 'flex';
-      elements.paneAsk.style.display = 'none';
-    }
-  };
-
-  elements.btnOpenAssistant.addEventListener('click', openAssistantModal);
-  elements.btnCloseAssistant.addEventListener('click', closeAssistantModal);
-  elements.btnDismissAssistant.addEventListener('click', closeAssistantModal);
-
-  elements.tabBtnAsk.addEventListener('click', () => switchAssistantTab('ask'));
-  elements.tabBtnTransform.addEventListener('click', () => switchAssistantTab('transform'));
-
-  // Quick Chips for Question / Analysis
-  document.querySelectorAll('#ask-chips-container .prompt-chip').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const q = btn.getAttribute('data-ask');
-      if (q) {
-        elements.assistantQuestionInput.value = q;
-        elements.assistantQuestionInput.focus();
-      }
-    });
+  el.btnLoadFile.addEventListener('click', pickFile);
+  el.btnBrowseCard.addEventListener('click', pickFile);
+  el.fileInput.addEventListener('change', (e) => {
+    handleFileUpload(e.target.files?.[0]);
+    e.target.value = '';
   });
 
-  // Quick Chips for Transformation
-  document.querySelectorAll('#transform-chips-container .prompt-chip').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const t = btn.getAttribute('data-transform');
-      if (t) {
-        elements.assistantTransformInput.value = t;
-        elements.assistantTransformInput.focus();
-      }
-    });
+  el.btnLoadDemo.addEventListener('click', async () => {
+    if (!(await confirmReplaceCurrent())) return;
+    loadCardIntoApp(DEMO_CARD, { fileName: 'Seraphina_Vale.json', kind: 'demo' });
+  });
+  el.btnRestoreDraft.addEventListener('click', restoreDraft);
+  el.btnDiscardDraft.addEventListener('click', async () => {
+    await clearDraft();
+    el.draftRestore.hidden = true;
   });
 
-  // Send Question to AI
-  elements.btnSendQuestion.addEventListener('click', async () => {
-    const question = elements.assistantQuestionInput.value.trim();
-    if (!question) {
-      showToast('Пожалуйста, введите ваш вопрос.', 'warning');
-      return;
-    }
-    if (!state.originalCard) {
-      showToast('Карточка не загружена.', 'warning');
-      return;
-    }
-
-    elements.btnSendQuestion.disabled = true;
-    elements.btnSendQuestion.innerHTML = '⏳ Анализируем...';
-    elements.assistantStatusText.textContent = 'ИИ анализирует карточку...';
-    appLog(`ИИ-Ассистент: вопрос «${question.length > 50 ? question.slice(0, 50) + '...' : question}» отправлен в LLM.`);
-
-    const cardSource = state.translatedCard?.data?.name ? state.translatedCard.data : state.originalCard.data;
-    const abortCtrl = new AbortController();
-
-    try {
-      const answer = await askCharacterAI({
-        cardData: cardSource,
-        question,
-        settings: state.settings,
-        signal: abortCtrl.signal
-      });
-
-      elements.assistantAskResultText.textContent = answer;
-      elements.assistantAskResultBox.style.display = 'block';
-      elements.assistantStatusText.textContent = 'Ответ готов';
-      showToast('ИИ подготовил разбор карточки!', 'success');
-      appLog(`ИИ-Ассистент: получен ответ (${answer.length} симв.).`, 'success');
-    } catch (err) {
-      showToast('Ошибка: ' + err.message, 'error');
-      elements.assistantStatusText.textContent = 'Ошибка запроса';
-      appLog(`ИИ-Ассистент: ошибка: ${err.message}`, 'error');
-    } finally {
-      elements.btnSendQuestion.disabled = false;
-      elements.btnSendQuestion.innerHTML = '🚀 Спросить ИИ';
-    }
+  el.avatarContainer.addEventListener('click', () => el.avatarInput.click());
+  el.avatarInput.addEventListener('change', (e) => {
+    handleAvatarUpload(e.target.files?.[0]);
+    e.target.value = '';
   });
 
-  // Copy Ask Result
-  elements.btnCopyAskResult.addEventListener('click', () => {
-    const text = elements.assistantAskResultText.textContent;
-    if (text) {
-      navigator.clipboard.writeText(text);
-      showToast('Ответ скопирован в буфер обмена!', 'info', 2000);
-    }
+  // Translation
+  el.btnTranslateAll.addEventListener('click', handleTranslateAll);
+  el.btnRetryFailed.addEventListener('click', handleRetryFailed);
+  el.btnCancelTranslation.addEventListener('click', () => state.abortController?.abort());
+
+  // Export
+  el.btnDownloadTransPng.addEventListener('click', downloadTranslatedPNG);
+  el.exportMenu.addEventListener('click', (e) => {
+    const action = e.target.closest('[data-menu]')?.dataset.menu;
+    if (action) handleMenuAction(action);
+  });
+  document.addEventListener('click', (e) => {
+    if (el.exportMenu.open && !el.exportMenu.contains(e.target)) el.exportMenu.open = false;
   });
 
-  // Execute Transformation
-  elements.btnExecuteTransform.addEventListener('click', async () => {
-    const instruction = elements.assistantTransformInput.value.trim();
-    if (!instruction) {
-      showToast('Пожалуйста, опишите задачу по изменению персонажа.', 'warning');
-      return;
-    }
-    if (!state.originalCard) {
-      showToast('Карточка не загружена.', 'warning');
-      return;
-    }
-
-    elements.btnExecuteTransform.disabled = true;
-    elements.btnExecuteTransform.innerHTML = '⏳ Трансформация...';
-    elements.assistantStatusText.textContent = 'ИИ перерабатывает карточку...';
-    appLog(`ИИ-Ассистент: трансформация по задаче «${instruction.length > 50 ? instruction.slice(0, 50) + '...' : instruction}» запущена.`);
-
-    const useTranslated = elements.assistantSourceSelect.value === 'translated';
-    const sourceCard = (useTranslated && state.translatedCard) ? state.translatedCard.data : state.originalCard.data;
-    const abortCtrl = new AbortController();
-
-    try {
-      const result = await transformCharacterAI({
-        cardData: sourceCard,
-        instruction,
-        settings: state.settings,
-        signal: abortCtrl.signal
-      });
-
-      state.pendingTransform = result;
-      elements.transformSummaryText.textContent = result.changesSummary;
-      elements.transformDiffList.innerHTML = '';
-
-      const labels = {
-        name: 'Имя',
-        description: 'Описание',
-        personality: 'Личность',
-        scenario: 'Сценарий',
-        first_mes: 'Первое сообщение',
-        mes_example: 'Примеры диалогов',
-        system_prompt: 'Системный промпт'
-      };
-
-      for (const [key, val] of Object.entries(result.modifiedFields)) {
-        if (!val) continue;
-        const item = document.createElement('div');
-        item.className = 'diff-card-item';
-        item.innerHTML = `
-          <div class="diff-card-header">
-            <span>${labels[key] || key}</span>
-            <span style="font-size: 0.7rem; color: var(--text-dim);">${val.length} симв.</span>
-          </div>
-          <div class="diff-card-text">${escapeHtml(val)}</div>
-        `;
-        elements.transformDiffList.appendChild(item);
-      }
-
-      elements.assistantTransformResultBox.style.display = 'block';
-      elements.assistantStatusText.textContent = 'Трансформация готова к применению';
-      showToast('Трансформация готова! Ознакомьтесь и нажмите «Применить».', 'success');
-      appLog(`ИИ-Ассистент: трансформация завершена (${Object.keys(result.modifiedFields).length} полей затронуто).`, 'success');
-    } catch (err) {
-      showToast('Ошибка трансформации: ' + err.message, 'error');
-      elements.assistantStatusText.textContent = 'Ошибка трансформации';
-      appLog(`ИИ-Ассистент: ошибка трансформации: ${err.message}`, 'error');
-    } finally {
-      elements.btnExecuteTransform.disabled = false;
-      elements.btnExecuteTransform.innerHTML = '⚡ Выполнить трансформацию';
-    }
+  // Editor: inputs
+  el.editorRows.addEventListener('input', (e) => {
+    const path = e.target.dataset?.bind;
+    if (!path || !state.translatedCard) return;
+    setBound(state.translatedCard.data, path, e.target.value);
+    delete state.failed[path];
+    if (e.target.tagName === 'TEXTAREA') autoSize(e.target);
+    const row = rowForPath(path);
+    if (row) updateRow(row);
+    updateSummary();
+    scheduleSave();
   });
 
-  // Apply Transformation Changes
-  elements.btnApplyTransform.addEventListener('click', () => {
-    if (!state.pendingTransform || !state.pendingTransform.modifiedFields) return;
-
-    const modified = state.pendingTransform.modifiedFields;
-    let count = 0;
-
-    for (const [key, val] of Object.entries(modified)) {
-      if (val !== undefined && val !== null) {
-        state.translatedCard.data[key] = val;
-        count++;
-      }
-    }
-
-    if (modified.name) {
-      elements.bannerCharName.textContent = modified.name;
-    }
-
-    renderFields();
-    updateCardStats();
-    closeAssistantModal();
-    state.pendingTransform = null;
-    showToast(`Успешно применено ${count} измененных полей к карточке!`, 'success', 5000);
-    appLog(`ИИ-Ассистент: применены изменения к ${count} полям карточки.`, 'success');
+  // Editor: row buttons
+  el.editorRows.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-act]');
+    if (!btn) return;
+    const rowId = btn.closest('.row')?.dataset.row;
+    if (!rowId) return;
+    if (btn.dataset.act === 'translate') handleTranslateRow(rowId);
+    else if (btn.dataset.act === 'reset') handleResetRow(rowId);
   });
 
-  // Log Console Drawer Controls
-  if (elements.btnToggleConsole) {
-    elements.btnToggleConsole.addEventListener('click', () => {
-      const isShown = elements.logConsoleDrawer.style.display === 'flex';
-      elements.logConsoleDrawer.style.display = isShown ? 'none' : 'flex';
+  // Field navigation
+  el.fieldNav.addEventListener('click', (e) => {
+    const rowId = e.target.closest('[data-goto]')?.dataset.goto;
+    if (!rowId) return;
+    const node = document.getElementById(rowDomId(rowId));
+    if (!node) return;
+    if (node.classList.contains('is-empty') && el.toggleHideEmpty.checked) {
+      el.toggleHideEmpty.checked = false;
+      el.editor.classList.remove('hide-empty');
+    }
+    node.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    node.classList.remove('is-flash');
+    void node.offsetWidth;
+    node.classList.add('is-flash');
+  });
+
+  // Textarea heights depend on column width (window resize, page scrollbar appearing)
+  let lastEditorWidth = 0;
+  new ResizeObserver((entries) => {
+    const width = entries[0].contentRect.width;
+    if (Math.abs(width - lastEditorWidth) < 1) return;
+    lastEditorWidth = width;
+    el.editorRows.querySelectorAll('textarea').forEach(autoSize);
+  }).observe(el.editorRows);
+
+  el.toggleHideEmpty.addEventListener('change', () => {
+    el.editor.classList.toggle('hide-empty', el.toggleHideEmpty.checked);
+  });
+  el.editor.classList.toggle('hide-empty', el.toggleHideEmpty.checked);
+
+  // Passport
+  el.passportContainer.addEventListener('input', (e) => {
+    if (!state.passport) return;
+    const key = e.target.dataset.passport;
+    const mapKey = e.target.dataset.passportMap;
+    if (key) state.passport[key] = e.target.value;
+    else if (mapKey) state.passport[mapKey] = textToMap(e.target.value);
+    else return;
+    state.passport.edited = true;
+    el.passportBadge.textContent = 'изменён вручную';
+    scheduleSave();
+  });
+  el.btnTogglePassport.addEventListener('click', () => {
+    el.passportContent.hidden = !el.passportContent.hidden;
+    el.btnTogglePassport.textContent = el.passportContent.hidden ? 'Развернуть' : 'Свернуть';
+  });
+  el.btnReanalyzePassport.addEventListener('click', handleReanalyzePassport);
+
+  // Drag & drop
+  let dragDepth = 0;
+  const hasFiles = (e) => Array.from(e.dataTransfer?.types || []).includes('Files');
+  window.addEventListener('dragenter', (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    dragDepth++;
+    if (!state.busy) el.dragOverlay.classList.add('active');
+  });
+  window.addEventListener('dragleave', (e) => {
+    if (!hasFiles(e)) return;
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (!dragDepth) el.dragOverlay.classList.remove('active');
+  });
+  window.addEventListener('dragover', (e) => {
+    if (hasFiles(e)) e.preventDefault();
+  });
+  window.addEventListener('drop', (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    dragDepth = 0;
+    el.dragOverlay.classList.remove('active');
+    handleFileUpload(e.dataTransfer.files?.[0]);
+  });
+
+  // Settings
+  el.btnOpenSettings.addEventListener('click', openSettings);
+  el.btnModelPill.addEventListener('click', openSettings);
+  el.btnCloseSettings.addEventListener('click', closeSettings);
+  el.btnCancelSettings.addEventListener('click', closeSettings);
+  el.btnSaveSettings.addEventListener('click', saveSettingsFromForm);
+  el.btnToggleKeyVisibility.addEventListener('click', () => {
+    el.settingApiKey.type = el.settingApiKey.type === 'password' ? 'text' : 'password';
+  });
+  el.settingProvider.addEventListener('change', (e) => {
+    const preset = PROVIDER_PRESETS[e.target.value];
+    if (!preset) return;
+    el.settingBaseUrl.value = preset.baseUrl;
+    updateProviderView(preset.id, preset.defaultModel);
+  });
+  el.settingModelSelect.addEventListener('change', (e) => {
+    if (e.target.value === '__custom__') el.settingModelCustom.focus();
+    else el.settingModelCustom.value = e.target.value;
+  });
+  el.btnRefreshModels.addEventListener('click', refreshModels);
+
+  // Assistant
+  el.btnOpenAssistant.addEventListener('click', openAssistant);
+  el.btnCloseAssistant.addEventListener('click', closeAssistant);
+  el.btnDismissAssistant.addEventListener('click', closeAssistant);
+  el.tabBtnAsk.addEventListener('click', () => switchAssistantTab('ask'));
+  el.tabBtnTransform.addEventListener('click', () => switchAssistantTab('transform'));
+  $('ask-chips-container').addEventListener('click', (e) => {
+    const q = e.target.closest('[data-ask]')?.dataset.ask;
+    if (q) {
+      el.assistantQuestionInput.value = q;
+      el.assistantQuestionInput.focus();
+    }
+  });
+  $('transform-chips-container').addEventListener('click', (e) => {
+    const t = e.target.closest('[data-transform]')?.dataset.transform;
+    if (t) {
+      el.assistantTransformInput.value = t;
+      el.assistantTransformInput.focus();
+    }
+  });
+  el.btnSendQuestion.addEventListener('click', handleAsk);
+  el.btnExecuteTransform.addEventListener('click', handleTransform);
+  el.btnApplyTransform.addEventListener('click', applyTransform);
+  el.btnCopyAskResult.addEventListener('click', async () => {
+    await navigator.clipboard.writeText(el.assistantAskResultText.textContent || '');
+    showToast('Ответ скопирован', 'info', { duration: 2000 });
+  });
+
+  // Close modals by clicking the backdrop
+  for (const [modal, close] of [[el.settingsModal, closeSettings], [el.assistantModal, closeAssistant]]) {
+    modal.addEventListener('mousedown', (e) => {
+      if (e.target === modal) close();
     });
   }
 
-  if (elements.btnCloseLogConsole) {
-    elements.btnCloseLogConsole.addEventListener('click', () => {
-      elements.logConsoleDrawer.style.display = 'none';
-    });
-  }
+  // Logs
+  el.btnToggleConsole.addEventListener('click', () => { el.logDrawer.hidden = !el.logDrawer.hidden; });
+  el.btnCloseLogConsole.addEventListener('click', () => { el.logDrawer.hidden = true; });
+  el.btnClearLogs.addEventListener('click', () => {
+    el.logBody.replaceChildren();
+    logBuffer.length = 0;
+    logCounter = 0;
+    el.logCountBadge.textContent = '0';
+  });
+  el.btnCopyLogs.addEventListener('click', async () => {
+    await navigator.clipboard.writeText(logBuffer.join('\n'));
+    showToast(`Скопировано строк: ${logBuffer.length}`, 'info', { duration: 2000 });
+  });
 
-  if (elements.btnClearLogs) {
-    elements.btnClearLogs.addEventListener('click', () => {
-      if (elements.logConsoleBody) elements.logConsoleBody.innerHTML = '';
-      logBuffer.length = 0;
-      logCounter = 0;
-      if (elements.logCountBadge) elements.logCountBadge.textContent = '0';
-      showToast('Консоль логов очищена.', 'info', 1500);
-    });
-  }
+  // Keyboard
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      if (resolveChoice) resolveChoice(null);
+      else if (el.settingsModal.classList.contains('active')) closeSettings();
+      else if (el.assistantModal.classList.contains('active')) closeAssistant();
+      else if (el.exportMenu.open) el.exportMenu.open = false;
+      else if (!el.logDrawer.hidden) el.logDrawer.hidden = true;
+    }
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's' && state.translatedCard) {
+      e.preventDefault();
+      downloadTranslatedPNG();
+    }
+  });
 
-  if (elements.btnCopyLogs) {
-    elements.btnCopyLogs.addEventListener('click', () => {
-      if (logBuffer.length === 0) {
-        showToast('Консоль пуста.', 'warning');
-        return;
-      }
-      navigator.clipboard.writeText(logBuffer.join('\n'));
-      showToast(`Скопировано ${logBuffer.length} строк логов!`, 'success', 2000);
-    });
-  }
+  // Flush the draft when the tab is hidden or closed
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden' && saveTimer) saveNow();
+  });
+  window.addEventListener('beforeunload', (e) => {
+    if (state.busy) {
+      e.preventDefault();
+      e.returnValue = '';
+    }
+  });
 }
 
 // Bootstrapping
 window.addEventListener('DOMContentLoaded', () => {
   initEvents();
-  updateSettingsModalUI();
-  appLog('Приложение AI Card Translator инициализировано. Консоль логов готова.');
+  updateHeaderModel();
+  showDraftOffer();
+  appLog('Приложение запущено.');
 });

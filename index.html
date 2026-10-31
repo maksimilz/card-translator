@@ -3,453 +3,401 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AI Character Card Translator & Editor | Client-side</title>
+  <title>Card Translator</title>
   <link rel="stylesheet" href="css/app.css">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎭</text></svg>">
 </head>
 <body>
 
-  <!-- App Header -->
   <header class="app-header">
-    <div class="brand-area">
+    <div class="brand">
       <div class="brand-logo">🎭</div>
       <div class="brand-title">
-        <h1>AI Card Translator <span class="badge-tag">100% Client-side</span></h1>
-        <p>Переводчик и редактор карточек SillyTavern / Chub (PNG & JSON)</p>
+        <h1>Card Translator</h1>
+        <p>Перевод карточек SillyTavern / Chub · PNG и JSON</p>
       </div>
     </div>
 
-    <div class="header-status">
-      <div class="status-pill" id="provider-pill" title="Текущий провайдер LLM">
+    <div class="header-actions">
+      <button class="model-pill" id="btn-model-pill" type="button" title="Текущая модель — нажмите, чтобы изменить">
         <span class="status-dot"></span>
-        <span id="header-provider-name">OpenRouter</span>:
-        <strong id="header-model-name">deepseek/deepseek-chat</strong>
-      </div>
-      <div class="status-pill">
-        Язык: <strong>RU (Русский)</strong>
-      </div>
-      <button class="btn btn-secondary btn-sm" id="btn-toggle-console" title="Открыть/закрыть встроенную консоль логов">
-        📜 Логи <span class="badge" id="log-count-badge" style="font-size: 0.65rem; padding: 1px 5px; margin-left: 2px;">0</span>
+        <span class="model-pill-provider" id="header-provider-name">—</span>
+        <strong class="model-pill-model" id="header-model-name">—</strong>
       </button>
-      <button class="btn btn-secondary btn-sm" id="btn-open-settings" title="Настройки API и моделей">
-        ⚙️ Настройки API
+      <button class="btn btn-ghost btn-sm" id="btn-toggle-console" type="button" title="Журнал событий">
+        Логи <span class="count-badge" id="log-count-badge">0</span>
       </button>
-      <button class="btn btn-primary btn-sm" id="btn-load-file">
-        📁 Открыть карточку
-      </button>
-      <input type="file" id="file-input" accept=".png,.json" style="display: none;">
-      <input type="file" id="avatar-input" accept="image/png,image/jpeg,image/webp" style="display: none;">
+      <button class="btn btn-ghost btn-sm" id="btn-open-settings" type="button">⚙️ Настройки</button>
+      <button class="btn btn-primary btn-sm" id="btn-load-file" type="button">Открыть карточку</button>
+      <input type="file" id="file-input" accept=".png,.json,image/png,application/json" hidden>
+      <input type="file" id="avatar-input" accept="image/png,image/jpeg,image/webp" hidden>
     </div>
   </header>
 
-  <!-- Main Container -->
+  <div class="boot-warning" id="file-protocol-warning" hidden>
+    Страница открыта как файл — браузер блокирует её модули, и приложение не запустится.
+    Запустите <code>start.bat</code> (или <code>python run.py</code>) и откройте адрес, который он покажет.
+  </div>
+  <script>
+    if (location.protocol === 'file:') document.getElementById('file-protocol-warning').hidden = false;
+  </script>
+
   <main class="main-container">
 
-    <!-- Welcome / Empty Dropzone -->
-    <section id="welcome-view" class="welcome-dropzone">
-      <div class="dropzone-icon">📥</div>
-      <h2>Перетащите сюда карточку персонажа</h2>
-      <p>Поддерживаются форматы <strong>PNG</strong> со встроенными метаданными (SillyTavern, TavernAI V2/V3) и файлы <strong>JSON</strong>.</p>
-      <div style="display: flex; gap: 12px; margin-top: 10px;">
-        <button class="btn btn-primary" id="btn-browse-card">Выбрать файл карточки</button>
-        <button class="btn btn-secondary" id="btn-load-demo">Загрузить пример карточки</button>
+    <!-- Welcome -->
+    <section id="welcome-view" class="welcome">
+      <div class="dropzone" id="dropzone">
+        <div class="dropzone-icon">📥</div>
+        <h2>Перетащите сюда карточку персонажа</h2>
+        <p>PNG со встроенными метаданными (V1 / V2 / V3) или JSON — SillyTavern, Chub, JanitorAI, RisuAI.</p>
+        <div class="dropzone-actions">
+          <button class="btn btn-primary" id="btn-browse-card" type="button">Выбрать файл</button>
+          <button class="btn btn-secondary" id="btn-load-demo" type="button">Открыть пример</button>
+        </div>
       </div>
-      <div style="margin-top: 24px; font-size: 0.8rem; color: var(--text-dim);">
-        🔒 100% безопасно: все файлы обрабатываются исключительно в вашем браузере
+
+      <div class="draft-card" id="draft-restore" hidden>
+        <div class="draft-card-text">
+          <strong>Незавершённая работа</strong>
+          <span id="draft-restore-info"></span>
+        </div>
+        <div class="draft-card-actions">
+          <button class="btn btn-primary btn-sm" id="btn-restore-draft" type="button">Продолжить</button>
+          <button class="btn btn-ghost btn-sm" id="btn-discard-draft" type="button">Удалить</button>
+        </div>
       </div>
+
+      <ul class="feature-list">
+        <li><strong>Паспорт персонажа.</strong> Сначала модель определяет пол, обращение к {{user}} и глоссарий — перевод получается согласованным.</li>
+        <li><strong>Макросы и разметка.</strong> {{char}}, {{user}}, &lt;START&gt;, *действия* сохраняются; расхождения подсвечиваются.</li>
+        <li><strong>Черновик сохраняется сам.</strong> Перезагрузка страницы не теряет перевод.</li>
+      </ul>
     </section>
 
-    <!-- Workspace View (Card Loaded) -->
-    <section id="workspace-view" style="display: none; flex-direction: column; gap: 16px;">
-      
-      <!-- Top Banner with Avatar, Character Info & Actions -->
+    <!-- Workspace -->
+    <section id="workspace-view" class="workspace" hidden>
+
       <div class="card-banner">
-        <div class="char-info-box">
-          <div class="avatar-wrapper" id="avatar-container" title="Нажмите, чтобы заменить картинку персонажа">
-            <img id="char-avatar" class="avatar-img" src="" alt="Аватар персонажа">
-            <div class="avatar-overlay">Сменить фото</div>
+        <div class="banner-main">
+          <div class="char-info">
+            <button class="avatar-wrapper" id="avatar-container" type="button" title="Нажмите, чтобы заменить картинку">
+              <img id="char-avatar" class="avatar-img" src="" alt="Аватар персонажа">
+              <span class="avatar-overlay">Сменить</span>
+            </button>
+            <div class="char-meta">
+              <h2 id="banner-char-name">Имя персонажа</h2>
+              <div class="char-badges">
+                <span class="badge" id="card-spec-badge">V2</span>
+                <span class="badge" id="stat-tokens" title="Примерный объём в токенах: оригинал → перевод">—</span>
+                <span class="badge badge-progress" id="stat-progress">—</span>
+                <span class="badge badge-dim" id="draft-status"></span>
+              </div>
+            </div>
           </div>
-          <div class="char-title-meta">
-            <h2 id="banner-char-name">Имя персонажа</h2>
-            <div class="char-badges">
-              <span class="badge" id="card-spec-badge">V2 Spec</span>
-              <span class="badge badge-stat" id="stat-orig-tokens" title="Примерные токены оригинала">Оригинал: ~0 токенов</span>
-              <span class="badge badge-stat" id="stat-trans-tokens" title="Примерные токены перевода" style="border-color: rgba(99, 102, 241, 0.4); color: #a5b4fc;">Перевод: ~0 токенов</span>
+
+          <div class="banner-actions">
+            <button class="btn btn-accent" id="btn-translate-all" type="button" title="Шаг 1: паспорт персонажа · Шаг 2: перевод всех полей">⚡ Перевести всё</button>
+            <button class="btn btn-warning" id="btn-retry-failed" type="button" hidden>↻ Повторить неудавшиеся</button>
+            <button class="btn btn-danger" id="btn-cancel-translation" type="button" hidden>■ Остановить</button>
+            <button class="btn btn-secondary" id="btn-open-assistant" type="button">🪄 Ассистент</button>
+            <div class="split-btn">
+              <button class="btn btn-success" id="btn-download-trans-png" type="button" title="PNG с переведёнными метаданными (Ctrl+S)">💾 Скачать PNG</button>
+              <details class="menu" id="export-menu">
+                <summary class="btn btn-success menu-toggle" title="Другие варианты экспорта">▾</summary>
+                <div class="menu-list">
+                  <button type="button" data-menu="trans-json">Перевод — JSON</button>
+                  <button type="button" data-menu="orig-png">Оригинал — PNG (исходный файл)</button>
+                  <button type="button" data-menu="orig-json">Оригинал — JSON</button>
+                  <hr>
+                  <button type="button" data-menu="copy-all-orig">Сбросить перевод к оригиналу</button>
+                  <button type="button" data-menu="close-card">Закрыть карточку</button>
+                </div>
+              </details>
             </div>
           </div>
         </div>
 
-        <div class="banner-actions">
-          <!-- Batch Translation Actions -->
-          <button class="btn btn-accent" id="btn-translate-all" title="Перевести всю карточку в 2 шага (анализ контекста + XML-перевод)">
-            ⚡ Перевести всю карточку
-          </button>
-          <button class="btn btn-primary" id="btn-open-assistant" title="Спросить ИИ о персонаже или дать задачу изменить карточку">
-            🪄 ИИ-Ассистент
-          </button>
-          <button class="btn btn-danger" id="btn-cancel-translation" style="display: none;">
-            ⏹️ Остановить
-          </button>
-          <button class="btn btn-secondary" id="btn-copy-all-orig" title="Скопировать все оригинальные поля в правую колонку">
-            📋 Скопировать оригинал
-          </button>
-
-          <!-- Export Options (Addressing user request for two copies) -->
-          <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-            <button class="btn btn-success" id="btn-download-trans-png" title="Скачать готовую карточку PNG с вшитыми переведенными метаданными">
-              💾 Скачать перевод (PNG)
-            </button>
-            <button class="btn btn-secondary btn-sm" id="btn-download-trans-json" title="Скачать только JSON переведенной карточки">
-              JSON
-            </button>
-            <button class="btn btn-secondary" id="btn-download-orig-png" title="Скачать оригинальную карточку PNG">
-              📥 Оригинал (PNG)
-            </button>
-            <button class="btn btn-secondary btn-sm" id="btn-download-orig-json" title="Скачать оригинальный JSON">
-              JSON
-            </button>
-          </div>
-        </div>
-
-        <!-- Batch Translation Progress Bar & Steps Indicator -->
-        <div class="batch-progress-bar-container" id="batch-progress-container" style="display: none;">
-          <div class="batch-progress-header">
-            <div class="batch-progress-steps">
-              <span class="step-pill" id="step-pill-1">Шаг 1: Контекст и глоссарий</span>
+        <div class="progress-panel" id="batch-progress-container" hidden>
+          <div class="progress-head">
+            <div class="progress-steps">
+              <span class="step-pill" id="step-pill-1">1 · Паспорт</span>
               <span class="step-separator">→</span>
-              <span class="step-pill" id="step-pill-2">Шаг 2: Полный перевод карточки</span>
+              <span class="step-pill" id="step-pill-2">2 · Перевод</span>
             </div>
-            <span class="batch-progress-text" id="batch-progress-text">Подготовка к переводу...</span>
+            <span class="progress-text" id="batch-progress-text">Подготовка...</span>
           </div>
-          <div class="batch-progress-track">
-            <div class="batch-progress-bar" id="batch-progress-bar"></div>
-          </div>
+          <div class="progress-track"><div class="progress-bar" id="batch-progress-bar"></div></div>
+          <div class="progress-detail" id="batch-progress-detail"></div>
         </div>
       </div>
 
-      <!-- Passport / Context Summary Box (Step 1) -->
-      <div id="passport-container" class="passport-container" style="display: none;">
-        <div class="passport-header">
+      <!-- Passport (Step 1), editable -->
+      <div id="passport-container" class="passport" hidden>
+        <div class="passport-head">
           <div class="passport-title">
-            <span style="font-size: 1.1rem;">📋</span>
-            <strong>Паспорт контекста персонажа (Шаг 1)</strong>
-            <span class="badge" id="passport-badge">Анализ завершен</span>
+            <strong>Паспорт персонажа</strong>
+            <span class="badge" id="passport-badge">Шаг 1</span>
+            <span class="passport-note">Правки применяются ко всем следующим переводам</span>
           </div>
-          <button class="btn btn-secondary btn-sm" id="btn-toggle-passport" type="button">
-            Свернуть / Развернуть
-          </button>
+          <div class="passport-actions">
+            <button class="btn btn-ghost btn-sm" id="btn-reanalyze-passport" type="button" title="Заново проанализировать карточку">↻ Пересоздать</button>
+            <button class="btn btn-ghost btn-sm" id="btn-toggle-passport" type="button">Свернуть</button>
+          </div>
         </div>
         <div class="passport-content" id="passport-content">
-          <div class="passport-meta-grid">
-            <div class="passport-chip">
-              <span class="passport-chip-label">Имя (RU):</span>
-              <strong id="passport-name">—</strong>
-            </div>
-            <div class="passport-chip">
-              <span class="passport-chip-label">Пол:</span>
-              <strong id="passport-gender">—</strong>
-            </div>
-            <div class="passport-chip">
-              <span class="passport-chip-label">Род глаголов:</span>
-              <strong id="passport-verb-gender">—</strong>
-            </div>
-            <div class="passport-chip">
-              <span class="passport-chip-label">Обращение:</span>
-              <strong id="passport-pronoun">—</strong>
-            </div>
-            <div class="passport-chip">
-              <span class="passport-chip-label">Тон речи:</span>
-              <strong id="passport-tone">—</strong>
-            </div>
+          <div class="passport-grid">
+            <label class="passport-field">
+              <span>Имя (RU)</span>
+              <input type="text" class="form-control" data-passport="character_name_ru">
+            </label>
+            <label class="passport-field">
+              <span>Пол</span>
+              <input type="text" class="form-control" data-passport="gender" list="gender-options">
+            </label>
+            <label class="passport-field">
+              <span>Род глаголов</span>
+              <input type="text" class="form-control" data-passport="verb_gender" list="verb-gender-options">
+            </label>
+            <label class="passport-field">
+              <span>Обращение к {{user}}</span>
+              <select class="form-control" data-passport="user_pronoun">
+                <option value="ты">ты</option>
+                <option value="вы">вы</option>
+              </select>
+            </label>
+            <label class="passport-field passport-field-wide">
+              <span>Тон речи</span>
+              <input type="text" class="form-control" data-passport="speech_tone">
+            </label>
           </div>
-          <div class="passport-glossary-box" id="passport-glossary-box" style="display: none;">
-            <div class="passport-glossary-title">Глоссарий терминов и имен:</div>
-            <div class="passport-glossary-list" id="passport-glossary-list"></div>
-          </div>
-          <div class="passport-glossary-box" id="passport-lorebook-box" style="display: none;">
-            <div class="passport-glossary-title">Ключи активации лорбука (Trigger Keys):</div>
-            <div class="passport-glossary-list" id="passport-lorebook-list"></div>
+          <div class="passport-maps">
+            <label class="passport-field">
+              <span>Глоссарий — по строке: <code>English = Русский</code></span>
+              <textarea class="form-control mono" rows="4" data-passport-map="glossary"></textarea>
+            </label>
+            <label class="passport-field">
+              <span>Ключи лорбука — <code>key = ключ</code></span>
+              <textarea class="form-control mono" rows="4" data-passport-map="lorebook_keys"></textarea>
+            </label>
           </div>
         </div>
+        <datalist id="gender-options"><option value="женский"><option value="мужской"><option value="иной"></datalist>
+        <datalist id="verb-gender-options"><option value="она сделала"><option value="он сделал"><option value="оно сделало"><option value="они сделали"></datalist>
       </div>
 
-      <!-- Side-by-Side Comparison Workspace -->
-      <div class="editor-grid">
-        
-        <!-- Left: Original Source -->
-        <div class="column-panel">
-          <div class="column-header">
-            <h3>📖 Исходная карточка (Оригинал)</h3>
-            <span class="badge" id="orig-fields-count">Исходные данные</span>
-          </div>
-          <div class="column-body" id="orig-fields-container">
-            <!-- Dynamically populated original fields -->
-          </div>
-        </div>
+      <div class="workspace-body">
+        <nav class="field-nav" id="field-nav" aria-label="Поля карточки"></nav>
 
-        <!-- Right: Translated & Editable Target -->
-        <div class="column-panel">
-          <div class="column-header">
-            <h3>✏️ Перевод и редактирование (RU)</h3>
-            <span class="badge" style="background: rgba(99, 102, 241, 0.2); color: #c7d2fe;">Готово для SillyTavern</span>
+        <div class="editor">
+          <div class="editor-head">
+            <div class="editor-col-title">Оригинал</div>
+            <div class="editor-col-title editor-col-title-trans">
+              <span>Перевод (RU)</span>
+              <label class="toggle"><input type="checkbox" id="toggle-hide-empty" checked> Скрыть пустые поля</label>
+            </div>
           </div>
-          <div class="column-body" id="trans-fields-container">
-            <!-- Dynamically populated editable fields with translate buttons -->
-          </div>
+          <div id="editor-rows" class="editor-rows"></div>
         </div>
-
       </div>
-
     </section>
-
   </main>
 
   <!-- Settings Modal -->
   <div class="modal-backdrop" id="settings-modal">
-    <div class="modal-box">
+    <div class="modal-box" role="dialog" aria-labelledby="settings-title">
       <div class="modal-header">
-        <h3>⚙️ Настройки LLM для перевода</h3>
-        <button class="btn-icon" id="btn-close-settings" title="Закрыть">&times;</button>
+        <h3 id="settings-title">Настройки модели</h3>
+        <button class="btn-icon" id="btn-close-settings" type="button" title="Закрыть">&times;</button>
       </div>
       <div class="modal-body">
-        
-        <!-- Provider Selection -->
         <div class="form-group">
-          <label for="setting-provider">Провайдер нейросети:</label>
+          <label for="setting-provider">Провайдер</label>
           <select id="setting-provider" class="form-control">
-            <option value="nanogpt">Nano-GPT (nano-gpt.com - DeepSeek, Claude, GPT)</option>
-            <option value="openrouter">OpenRouter (Claude, DeepSeek, GPT-4o, Gemini, Qwen)</option>
-            <option value="ollama">Ollama (Локальный сервер localhost:11434)</option>
-            <option value="lmstudio">LM Studio (Локальный сервер localhost:1234)</option>
-            <option value="custom">Пользовательский OpenAI-совместимый эндпоинт</option>
+            <option value="nanogpt">Nano-GPT</option>
+            <option value="openrouter">OpenRouter</option>
+            <option value="ollama">Ollama (локально)</option>
+            <option value="lmstudio">LM Studio (локально)</option>
+            <option value="custom">OpenAI-совместимый эндпоинт</option>
           </select>
-          <div class="form-hint" id="provider-hint">
-            Требуется API-ключ OpenRouter.
-          </div>
+          <div class="form-hint" id="provider-hint"></div>
         </div>
 
-        <!-- API Key (for OpenRouter / Custom) -->
         <div class="form-group" id="group-api-key">
-          <label for="setting-api-key">API Ключ (OpenRouter / Auth Token):</label>
-          <div style="position: relative;">
-            <input type="password" id="setting-api-key" class="form-control" placeholder="sk-or-v1-...">
-            <button type="button" id="btn-toggle-key-visibility" class="btn-icon" style="position: absolute; right: 6px; top: 6px; background: transparent; border: none;">👁️</button>
+          <label for="setting-api-key">API-ключ</label>
+          <div class="input-with-btn">
+            <input type="password" id="setting-api-key" class="form-control" placeholder="sk-..." autocomplete="off">
+            <button type="button" id="btn-toggle-key-visibility" class="btn btn-ghost btn-sm" title="Показать / скрыть">👁</button>
           </div>
-          <div class="form-hint">Ключ хранится строго локально в вашем браузере (localStorage) и никуда не передается.</div>
+          <div class="form-hint">Хранится только в этом браузере (localStorage).</div>
         </div>
 
-        <!-- Base URL -->
         <div class="form-group">
-          <label for="setting-base-url">Базовый URL эндпоинта:</label>
-          <input type="text" id="setting-base-url" class="form-control" value="https://openrouter.ai/api/v1">
+          <label for="setting-base-url">Базовый URL</label>
+          <input type="text" id="setting-base-url" class="form-control">
         </div>
 
-        <!-- Model Selection with Refresh Button -->
         <div class="form-group">
-          <div style="display: flex; justify-content: space-between; align-items: center;">
-            <label for="setting-model">Модель:</label>
-            <button type="button" class="btn btn-secondary btn-sm" id="btn-refresh-models" title="Запросить список моделей через /v1/models">
-              🔄 Обновить список моделей
-            </button>
+          <div class="label-row">
+            <label for="setting-model-select">Модель</label>
+            <button type="button" class="btn btn-ghost btn-sm" id="btn-refresh-models">↻ Обновить список</button>
           </div>
-          <div style="display: flex; gap: 8px;">
-            <select id="setting-model-select" class="form-control" style="flex: 1;">
-              <!-- Options populated dynamically -->
-            </select>
-            <input type="text" id="setting-model-custom" class="form-control" placeholder="или введите вручную" style="flex: 1;">
+          <div class="model-row">
+            <select id="setting-model-select" class="form-control"></select>
+            <input type="text" id="setting-model-custom" class="form-control" placeholder="или введите id модели">
           </div>
-          <div class="form-hint">Выберите из популярных пресетов или загрузите список прямо из эндпоинта.</div>
         </div>
 
-        <!-- CORS Instructions for Local LLMs -->
-        <div id="local-cors-help" style="display: none; background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.3); border-radius: var(--radius-sm); padding: 12px; font-size: 0.8rem;">
-          <strong>💡 Настройка CORS для локальных моделей:</strong>
-          <p style="margin-top: 4px;" id="cors-help-text">
-            Для Ollama в командной строке перед запуском выполните:<br>
-            <code class="code-pill">set OLLAMA_ORIGINS=* &amp;&amp; ollama serve</code>
-          </p>
+        <div class="local-help" id="local-cors-help" hidden>
+          <strong>Локальная модель и CORS</strong>
+          <p id="cors-help-text"></p>
         </div>
 
-        <!-- System Prompt -->
-        <div class="form-group">
-          <div style="display: flex; justify-content: space-between; align-items: center;">
-            <label for="setting-system-prompt">Системный промпт переводчика:</label>
-            <button type="button" class="btn btn-secondary btn-sm" id="btn-reset-prompt" style="font-size: 0.75rem;">
-              Сбросить на стандартный
-            </button>
-          </div>
-          <textarea id="setting-system-prompt" class="form-control" rows="6" style="font-size: 0.8rem; line-height: 1.4;"></textarea>
-          <div class="form-hint">Инструкция гарантирует сохранение {{char}}, {{user}}, &lt;START&gt;, замену JanitorAI {{sub}}/{{obj}} на {{user}}, звездочек действий и живой русский язык.</div>
-        </div>
-
-        <!-- Temperature -->
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 14px;">
+        <div class="form-grid">
           <div class="form-group">
-            <label for="setting-temperature">Температура (Креативность):</label>
-            <input type="number" id="setting-temperature" class="form-control" min="0" max="1" step="0.05" value="0.3">
+            <label for="setting-temperature">Температура</label>
+            <input type="number" id="setting-temperature" class="form-control" min="0" max="2" step="0.05">
           </div>
           <div class="form-group">
-            <label for="setting-max-tokens">Max Tokens на ответ:</label>
-            <input type="number" id="setting-max-tokens" class="form-control" value="8192" min="1024" max="65536" step="512">
-            <div class="form-hint">Лимит токенов на ответ (рекомендуется 8192 или 16384 для современных LLM).</div>
+            <label for="setting-max-tokens">Max Tokens на ответ</label>
+            <input type="number" id="setting-max-tokens" class="form-control" min="1024" max="131072" step="1024">
           </div>
         </div>
+        <div class="form-hint">От Max Tokens зависит размер пакетов: чем больше лимит, тем больше полей уходит в один запрос.</div>
 
+        <div class="form-group checks">
+          <label class="toggle"><input type="checkbox" id="setting-stream"> Потоковый ответ (stream) — виден прогресс, нет таймаутов на длинных полях</label>
+          <label class="toggle"><input type="checkbox" id="setting-translate-tags"> Переводить теги</label>
+        </div>
+
+        <div class="form-group">
+          <label for="setting-extra-instructions">Дополнительные пожелания переводчику</label>
+          <textarea id="setting-extra-instructions" class="form-control" rows="3" placeholder="Например: имена не переводить, а транслитерировать; сохранять мат; обращение строго на «вы»"></textarea>
+          <div class="form-hint">Добавляется к встроенному промпту. Правила про макросы и разметку уже включены.</div>
+        </div>
       </div>
       <div class="modal-footer">
-        <button class="btn btn-secondary" id="btn-cancel-settings">Отмена</button>
-        <button class="btn btn-primary" id="btn-save-settings">Сохранить настройки</button>
+        <button class="btn btn-secondary" id="btn-cancel-settings" type="button">Отмена</button>
+        <button class="btn btn-primary" id="btn-save-settings" type="button">Сохранить</button>
       </div>
     </div>
   </div>
 
-  <!-- AI Assistant Modal (Ask / Transform) -->
+  <!-- Assistant Modal -->
   <div class="modal-backdrop" id="assistant-modal">
-    <div class="modal-box modal-lg">
+    <div class="modal-box modal-lg" role="dialog" aria-labelledby="assistant-title">
       <div class="modal-header">
-        <div style="display: flex; align-items: center; gap: 10px;">
-          <span style="font-size: 1.4rem;">🪄</span>
-          <div>
-            <h3 style="margin-bottom: 2px;">ИИ-Ассистент карточки</h3>
-            <p style="font-size: 0.75rem; color: var(--text-muted); margin: 0;">Анализ, объяснение и образная адаптация персонажа по вашей задаче</p>
-          </div>
+        <div>
+          <h3 id="assistant-title">🪄 Ассистент карточки</h3>
+          <p class="modal-subtitle">Разбор персонажа или переработка карточки по вашей задаче</p>
         </div>
-        <button class="btn-icon" id="btn-close-assistant" title="Закрыть">&times;</button>
+        <button class="btn-icon" id="btn-close-assistant" type="button" title="Закрыть">&times;</button>
       </div>
 
-      <!-- Tab Navigation -->
       <div class="modal-tabs">
-        <button class="modal-tab active" id="tab-btn-ask" data-tab="ask">
-          ❓ Вопрос / Анализ карточки
-        </button>
-        <button class="modal-tab" id="tab-btn-transform" data-tab="transform">
-          ✨ Изменить персонажа (Задача)
-        </button>
+        <button class="modal-tab active" id="tab-btn-ask" type="button">Вопрос / анализ</button>
+        <button class="modal-tab" id="tab-btn-transform" type="button">Изменить персонажа</button>
       </div>
 
       <div class="modal-body">
-        <!-- Tab 1: Ask / Explain -->
-        <div class="tab-pane active" id="pane-ask">
-          <div class="assistant-section-hint">
-            Задайте любой вопрос об ИИ-персонаже. Модель проанализирует карточку и подробно объяснит суть роли, психологию, лор или скрытые директивы.
+        <div class="tab-pane" id="pane-ask">
+          <div class="prompt-chips" id="ask-chips-container">
+            <button type="button" class="prompt-chip" data-ask="В чём главная концепция, предыстория и тайна этого персонажа?">Концепция и тайна</button>
+            <button type="button" class="prompt-chip" data-ask="Как этот персонаж должен вести себя в диалоге с {{user}}? Какие у него манеры и триггеры?">Как вести диалог</button>
+            <button type="button" class="prompt-chip" data-ask="Разбери первое сообщение: каков здесь сюжетный конфликт, обстановка и что ожидается от {{user}}?">Разбор первого сообщения</button>
+            <button type="button" class="prompt-chip" data-ask="Объясни скрытые инструкции (системный промпт, post-history) и записи лорбука. Как они влияют на ответы?">Скрытые инструкции</button>
+            <button type="button" class="prompt-chip" data-ask="Найди в карточке противоречия, слабые места и то, что модель может понять неправильно. Предложи исправления.">Слабые места</button>
           </div>
-
-          <div class="prompt-chips-label">Быстрые вопросы в 1 клик:</div>
-          <div class="prompt-chips-container" id="ask-chips-container">
-            <button type="button" class="prompt-chip" data-ask="В чём главная концепция, предыстория и тайна этого персонажа?">🔍 В чём концепция и тайна?</button>
-            <button type="button" class="prompt-chip" data-ask="Как этот персонаж должен вести себя в диалоге с {{user}}? Какие у него манеры и триггеры?">🎭 Как вести диалог?</button>
-            <button type="button" class="prompt-chip" data-ask="Разбери первое сообщение: каков здесь сюжетный конфликт, обстановка и что ожидается от {{user}}?">📜 Разбор первого сообщения</button>
-            <button type="button" class="prompt-chip" data-ask="Объясни скрытые инструкции (системный промпт, post-history) и записи лорбука. Как они влияют на ответы?">⚙️ Скрытые инструкции и лорбук</button>
+          <div class="form-group">
+            <label for="assistant-question-input">Ваш вопрос</label>
+            <textarea id="assistant-question-input" class="form-control" rows="3" placeholder="Например: почему персонаж насторожен с {{user}} и как это обыграть?"></textarea>
           </div>
-
-          <div class="form-group" style="margin-top: 14px;">
-            <label for="assistant-question-input">Ваш вопрос к ИИ:</label>
-            <textarea id="assistant-question-input" class="form-control" rows="3" placeholder="Например: Почему персонаж так настороженно относится к игроку и как это обыграть?"></textarea>
+          <div class="pane-actions">
+            <button class="btn btn-primary" id="btn-send-question" type="button">Спросить</button>
           </div>
-
-          <div style="display: flex; justify-content: flex-end; gap: 8px;">
-            <button class="btn btn-primary" id="btn-send-question">
-              🚀 Спросить ИИ
-            </button>
-          </div>
-
-          <!-- Question Result Box -->
-          <div id="assistant-ask-result-box" style="display: none; margin-top: 16px;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-              <strong style="color: #a5b4fc; font-size: 0.85rem;">Ответ ИИ:</strong>
-              <button class="btn btn-secondary btn-sm" id="btn-copy-ask-result" title="Скопировать ответ">📋 Копировать ответ</button>
+          <div id="assistant-ask-result-box" class="result-box" hidden>
+            <div class="result-head">
+              <strong>Ответ</strong>
+              <button class="btn btn-ghost btn-sm" id="btn-copy-ask-result" type="button">Копировать</button>
             </div>
-            <div class="assistant-answer-view" id="assistant-ask-result-text"></div>
+            <div class="assistant-answer" id="assistant-ask-result-text"></div>
           </div>
         </div>
 
-        <!-- Tab 2: Transform / Modify -->
-        <div class="tab-pane" id="pane-transform" style="display: none;">
-          <div class="assistant-section-hint">
-            Опишите своими словами, что нужно образно изменить в персонаже (характер, манеру речи, сеттинг, конфликт или предысторию). ИИ адаптирует карточку с сохранением всех макросов (<code>{{char}}</code>, <code>{{user}}</code>, <code>&lt;START&gt;</code>).
+        <div class="tab-pane" id="pane-transform" hidden>
+          <div class="prompt-chips" id="transform-chips-container">
+            <button type="button" class="prompt-chip" data-transform="Сделай персонажа дерзким, язвительным и саркастичным, с острым чёрным юмором, но скрытой симпатией к {{user}}.">Дерзкий и саркастичный</button>
+            <button type="button" class="prompt-chip" data-transform="Сделай персонажа очень заботливым, мягким, тёплым и нежным по отношению к {{user}}.">Заботливый и мягкий</button>
+            <button type="button" class="prompt-chip" data-transform="Сделай персонажа холодным, сдержанным и гордым аристократом. Обращение к {{user}} строго на «вы».">Холодный аристократ</button>
+            <button type="button" class="prompt-chip" data-transform="Перенеси сеттинг карточки в неоновый киберпанк: измени технологии, окружение и первое сообщение.">Сеттинг: киберпанк</button>
+            <button type="button" class="prompt-chip" data-transform="Перенеси сеттинг карточки в мрачное фэнтези с атмосферой древней магии.">Сеттинг: dark fantasy</button>
+            <button type="button" class="prompt-chip" data-transform="Усиль эмоциональное напряжение, интригу и драму в первом сообщении и сценарии.">Больше драмы</button>
           </div>
-
-          <div class="prompt-chips-label">Идеи трансформации в 1 клик:</div>
-          <div class="prompt-chips-container" id="transform-chips-container">
-            <button type="button" class="prompt-chip" data-transform="Сделай персонажа дерзким, язвительным и саркастичным, с острым черным юмором, но скрытой симпатией к {{user}}.">😼 Дерзкий и саркастичный</button>
-            <button type="button" class="prompt-chip" data-transform="Сделай персонажа очень заботливым, мягким, теплым и нежным по отношению к {{user}}.">💖 Заботливый и мягкий</button>
-            <button type="button" class="prompt-chip" data-transform="Сделай персонажа холодным, сдержанным и гордым аристократом. Обращение к {{user}} строго на «Вы».">❄️ Холодный аристократ (на «Вы»)</button>
-            <button type="button" class="prompt-chip" data-transform="Перенеси сеттинг карточки в неоновый киберпанк: измени технологии, окружение и первое сообщение.">🏙️ Сеттинг: Киберпанк</button>
-            <button type="button" class="prompt-chip" data-transform="Перенеси сеттинг карточки в темное мрачное фэнтези (Dark Fantasy) с атмосферой древней магии.">🏰 Сеттинг: Dark Fantasy</button>
-            <button type="button" class="prompt-chip" data-transform="Усиль эмоциональное напряжение, интригу и драму в первом сообщении и описании сценария.">💥 Усилить драму и конфликт</button>
-          </div>
-
-          <div class="form-group" style="margin-top: 14px;">
-            <label for="assistant-transform-input">Творческая задача / Инструкция по изменению:</label>
+          <div class="form-group">
+            <label for="assistant-transform-input">Что изменить</label>
             <textarea id="assistant-transform-input" class="form-control" rows="3" placeholder="Опишите желаемые изменения..."></textarea>
           </div>
-
-          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
-            <div style="font-size: 0.8rem; color: var(--text-muted);">
-              Источник данных:
-              <select id="assistant-source-select" class="form-control" style="display: inline-block; width: auto; padding: 3px 8px; font-size: 0.8rem;">
-                <option value="translated" selected>Текущая карточка перевода (Справа)</option>
-                <option value="original">Оригинальная карточка (Слева)</option>
+          <div class="pane-actions pane-actions-split">
+            <label class="inline-select">Источник:
+              <select id="assistant-source-select" class="form-control">
+                <option value="translated" selected>текущий перевод</option>
+                <option value="original">оригинал</option>
               </select>
-            </div>
-            <button class="btn btn-accent" id="btn-execute-transform">
-              ⚡ Выполнить трансформацию
-            </button>
+            </label>
+            <button class="btn btn-accent" id="btn-execute-transform" type="button">Выполнить</button>
           </div>
-
-          <!-- Transform Result Preview Box -->
-          <div id="assistant-transform-result-box" style="display: none; margin-top: 16px;">
-            <div class="transform-summary-card">
-              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                <strong style="color: #34d399; font-size: 0.9rem;">✨ Сводка изменений:</strong>
-                <button class="btn btn-success btn-sm" id="btn-apply-transform">
-                  ✅ Применить к карточке
-                </button>
-              </div>
-              <div id="transform-summary-text" style="font-size: 0.85rem; line-height: 1.5; color: var(--text-main); margin-bottom: 12px; white-space: pre-wrap;"></div>
-              <div id="transform-diff-list" class="transform-diff-list"></div>
+          <div id="assistant-transform-result-box" class="result-box" hidden>
+            <div class="result-head">
+              <strong>Что изменено</strong>
+              <button class="btn btn-success btn-sm" id="btn-apply-transform" type="button">Применить к переводу</button>
             </div>
+            <div id="transform-summary-text" class="transform-summary"></div>
+            <div id="transform-diff-list" class="transform-diff-list"></div>
           </div>
         </div>
       </div>
 
-      <div class="modal-footer" style="justify-content: space-between;">
-        <span id="assistant-status-text" style="font-size: 0.8rem; color: var(--text-dim);">Готов к работе</span>
-        <button class="btn btn-secondary" id="btn-dismiss-assistant">Закрыть</button>
+      <div class="modal-footer modal-footer-split">
+        <span id="assistant-status-text" class="muted">Готов к работе</span>
+        <button class="btn btn-secondary" id="btn-dismiss-assistant" type="button">Закрыть</button>
       </div>
     </div>
   </div>
 
-  <!-- Drag and Drop Global Overlay -->
+  <!-- Choice dialog -->
+  <div class="modal-backdrop" id="choice-modal">
+    <div class="modal-box modal-sm" role="dialog" aria-labelledby="choice-title">
+      <div class="modal-header">
+        <h3 id="choice-title"></h3>
+      </div>
+      <div class="modal-body">
+        <p id="choice-text" class="choice-text"></p>
+      </div>
+      <div class="modal-footer" id="choice-actions"></div>
+    </div>
+  </div>
+
   <div id="drag-overlay">
-    <div style="font-size: 64px; margin-bottom: 16px;">📥</div>
-    <h2 style="font-size: 1.8rem; font-weight: 700;">Отпустите файл здесь</h2>
-    <p style="color: var(--text-muted);">PNG карточка или JSON файл</p>
-  </div>
-
-  <!-- In-App Docked Log Console Drawer -->
-  <div class="log-console-drawer" id="log-console-drawer" style="display: none;">
-    <div class="log-console-header">
-      <div class="log-console-title">
-        <span>📜</span>
-        <strong>Консоль событий и логов</strong>
-        <span class="badge" id="log-console-status">Онлайн</span>
-      </div>
-      <div style="display: flex; gap: 8px; align-items: center;">
-        <button class="btn btn-secondary btn-sm" id="btn-copy-logs" title="Скопировать все логи">📋 Копировать</button>
-        <button class="btn btn-secondary btn-sm" id="btn-clear-logs" title="Очистить консоль">🧹 Очистить</button>
-        <button class="btn-icon" id="btn-close-log-console" title="Свернуть консоль">&times;</button>
-      </div>
-    </div>
-    <div class="log-console-body" id="log-console-body">
-      <!-- Log rows injected dynamically -->
+    <div class="drag-overlay-inner">
+      <div class="drag-overlay-icon">📥</div>
+      <h2>Отпустите файл</h2>
+      <p>PNG-карточка или JSON</p>
     </div>
   </div>
 
-  <!-- Toast Notification Container -->
-  <div id="toast-container"></div>
+  <div class="log-drawer" id="log-console-drawer" hidden>
+    <div class="log-drawer-head">
+      <strong>Журнал событий</strong>
+      <div class="log-drawer-actions">
+        <button class="btn btn-ghost btn-sm" id="btn-copy-logs" type="button">Копировать</button>
+        <button class="btn btn-ghost btn-sm" id="btn-clear-logs" type="button">Очистить</button>
+        <button class="btn-icon" id="btn-close-log-console" type="button" title="Закрыть">&times;</button>
+      </div>
+    </div>
+    <div class="log-drawer-body" id="log-console-body"></div>
+  </div>
 
-  <!-- Scripts -->
+  <div id="toast-container" aria-live="polite"></div>
+
   <script type="module" src="js/app.js"></script>
 </body>
 </html>

@@ -1,26 +1,75 @@
-import os
-import sys
-import time
-import socket
-import threading
-import webbrowser
-import ssl
-import json
+"""
+Local launcher for AI Card Translator.
+
+Serves the static app on 127.0.0.1 and exposes /api-proxy?target=<url> — a small
+CORS proxy so the browser can talk to LLM APIs that do not send CORS headers.
+Streaming (text/event-stream) responses are passed through chunk by chunk.
+
+    python run.py [--port 8000] [--no-browser] [--insecure]
+"""
+import argparse
 import gzip
 import ipaddress
-import urllib.request
+import json
+import os
+import socket
+import ssl
+import threading
+import time
 import urllib.error
 import urllib.parse
+import urllib.request
+import webbrowser
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
-# SSL context that avoids CRL check timeouts in corporate Windows environments
-SSL_CTX = ssl._create_unverified_context()
+LOCAL_HOSTS = ('127.0.0.1', 'localhost', '::1')
 
-# Headers to ignore when forwarding
-IGNORED_FORWARD_HEADERS = {
-    'host', 'origin', 'referer', 'content-length', 'connection',
-    'sec-fetch-mode', 'sec-fetch-site', 'sec-fetch-dest', 'accept-encoding'
+# Seconds of upstream silence before giving up. Applies per socket read, so a
+# streaming response may run longer as long as tokens keep arriving.
+UPSTREAM_TIMEOUT = 300
+
+# Verified TLS by default; main() swaps in an unverified context for --insecure.
+SSL_CTX = ssl.create_default_context()
+
+# Request headers that must not be forwarded upstream
+SKIP_FORWARD_HEADERS = {
+    'host', 'origin', 'referer', 'content-length', 'connection', 'cookie',
+    'accept-encoding', 'x-target-url', 'upgrade-insecure-requests',
 }
+
+METADATA_HOSTS = ('metadata.google.internal', 'metadata', 'instance-data')
+
+
+def is_local_hostname(hostname):
+    return (hostname or '').strip('[]').lower() in LOCAL_HOSTS
+
+
+def is_metadata_host(hostname):
+    """Blocks cloud metadata endpoints and link-local addresses (SSRF protection)."""
+    host = hostname.rstrip('.').lower()
+    if host in METADATA_HOSTS or host.endswith('.metadata.google.internal'):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return host.startswith('169.254.')
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return ip.is_link_local
+
+
+def maybe_gunzip(data, encoding):
+    if encoding == 'gzip' or data[:2] == b'\x1f\x8b':
+        try:
+            return gzip.decompress(data)
+        except OSError:
+            pass
+    return data
+
+
+def log(tag, message):
+    print(f"[{time.strftime('%H:%M:%S')}] [{tag}] {message}", flush=True)
+
 
 class ProxyAndStaticServer(SimpleHTTPRequestHandler):
     def end_headers(self):
@@ -29,196 +78,203 @@ class ProxyAndStaticServer(SimpleHTTPRequestHandler):
             try:
                 parsed_origin = urllib.parse.urlparse(origin)
                 # Allow only local origins (http://localhost:* or http://127.0.0.1:*)
-                if parsed_origin.scheme == 'http' and parsed_origin.hostname in ('127.0.0.1', 'localhost', '::1'):
+                if parsed_origin.scheme == 'http' and parsed_origin.hostname in LOCAL_HOSTS:
                     self.send_header('Access-Control-Allow-Origin', origin)
                     self.send_header('Vary', 'Origin')
-                    self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, DELETE')
+                    self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
                     self.send_header('Access-Control-Allow-Headers', '*')
                     self.send_header('Access-Control-Max-Age', '86400')
-            except Exception:
+            except ValueError:
                 pass
+        if not self.path.startswith('/api-proxy'):
+            # Always serve fresh JS/CSS so updates apply without a hard reload
+            self.send_header('Cache-Control', 'no-cache')
         super().end_headers()
 
+    def host_allowed(self):
+        """Rejects requests whose Host is not local (DNS rebinding protection)."""
+        host = self.headers.get('Host', '')
+        hostname = urllib.parse.urlsplit('//' + host).hostname if host else ''
+        if is_local_hostname(hostname):
+            return True
+        self.send_json(403, 'Forbidden host')
+        return False
+
     def do_OPTIONS(self):
-        self.send_response(200)
+        if not self.host_allowed():
+            return
+        self.send_response(204)
         self.end_headers()
 
     def do_GET(self):
+        if not self.host_allowed():
+            return
         if self.path.startswith('/api-proxy'):
             self.handle_proxy()
         else:
             super().do_GET()
 
     def do_POST(self):
+        if not self.host_allowed():
+            return
         if self.path.startswith('/api-proxy'):
             self.handle_proxy()
         else:
             self.send_error(404, "Not found")
 
+    def send_json(self, status, message):
+        body = json.dumps({"error": {"message": message}}, ensure_ascii=False).encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def handle_proxy(self):
         parsed = urllib.parse.urlparse(self.path)
-        qs = urllib.parse.parse_qs(parsed.query)
-        target_url = qs.get('target', [None])[0] or self.headers.get('X-Target-URL')
+        target_url = urllib.parse.parse_qs(parsed.query).get('target', [None])[0]
 
         if not target_url:
-            self.send_response(400)
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.end_headers()
-            self.wfile.write(b'{"error": "Missing target parameter in query string"}')
+            self.send_json(400, "Missing target parameter in query string")
             return
 
         parsed_target = urllib.parse.urlparse(target_url)
-        scheme = (parsed_target.scheme or '').lower()
-        if scheme not in ('http', 'https'):
-            self.send_response(400)
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.end_headers()
-            self.wfile.write(b'{"error": "Invalid scheme: only http and https are allowed"}')
+        if (parsed_target.scheme or '').lower() not in ('http', 'https'):
+            self.send_json(400, "Invalid scheme: only http and https are allowed")
             return
 
         hostname = (parsed_target.hostname or '').lower()
         if not hostname:
-            self.send_response(400)
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.end_headers()
-            self.wfile.write(b'{"error": "Invalid target host"}')
+            self.send_json(400, "Invalid target host")
             return
 
-        # Block cloud metadata IPs and link-local addresses (SSRF protection)
-        norm_host = hostname.rstrip('.')
-        is_metadata = (
-            norm_host in ('metadata.google.internal', 'metadata', 'instance-data')
-            or norm_host.endswith('.metadata.google.internal')
-        )
-        if not is_metadata:
-            try:
-                ip_obj = ipaddress.ip_address(norm_host)
-                if ip_obj.version == 6 and getattr(ip_obj, 'ipv4_mapped', None):
-                    ip_obj = ip_obj.ipv4_mapped
-                if ip_obj.is_link_local or str(ip_obj).startswith('169.254.'):
-                    is_metadata = True
-            except ValueError:
-                if norm_host == '169.254.169.254' or norm_host.startswith('169.254.'):
-                    is_metadata = True
-
-        if is_metadata:
-            self.send_response(403)
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.end_headers()
-            self.wfile.write(b'{"error": "Access to cloud metadata IP (169.254.169.254) is forbidden"}')
+        if is_metadata_host(hostname):
+            self.send_json(403, "Access to cloud metadata IP (169.254.169.254) is forbidden")
             return
 
-        content_length = int(self.headers.get('Content-Length', 0))
+        content_length = int(self.headers.get('Content-Length') or 0)
         body = self.rfile.read(content_length) if content_length > 0 else None
 
-        # Headers to forward
         forward_headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
         }
         for k, v in self.headers.items():
-            if k.lower() in IGNORED_FORWARD_HEADERS:
+            lk = k.lower()
+            if lk in SKIP_FORWARD_HEADERS or lk.startswith('sec-'):
                 continue
             forward_headers[k] = v
 
-        # Check authentication headers and ensure both Authorization and x-api-key are passed
-        auth_val = forward_headers.get('Authorization') or forward_headers.get('authorization')
-        api_key_val = forward_headers.get('x-api-key') or forward_headers.get('X-Api-Key')
-
+        # Some OpenAI-compatible APIs want Authorization, others x-api-key: send both
+        lower_keys = {k.lower(): k for k in forward_headers}
+        auth_val = forward_headers.get(lower_keys.get('authorization', ''), '')
+        api_key_val = forward_headers.get(lower_keys.get('x-api-key', ''), '')
         if auth_val and not api_key_val:
-            raw_key = auth_val.replace('Bearer ', '').replace('bearer ', '').strip()
-            forward_headers['x-api-key'] = raw_key
+            forward_headers['x-api-key'] = auth_val.split(' ', 1)[-1].strip()
         elif api_key_val and not auth_val:
             forward_headers['Authorization'] = f"Bearer {api_key_val.strip()}"
+        has_key = bool(auth_val or api_key_val)
 
-        has_key = bool(forward_headers.get('x-api-key') or forward_headers.get('Authorization'))
-        target_short = target_url.split('?')[0]
-
-        # Extract model from JSON body if present
-        model_name = ""
+        model_name = ''
+        wants_stream = False
         if body:
             try:
                 body_json = json.loads(body.decode('utf-8'))
                 model_name = body_json.get('model', '')
-            except Exception:
+                wants_stream = bool(body_json.get('stream'))
+            except (ValueError, AttributeError):
                 pass
 
-        now = time.strftime('%H:%M:%S')
+        target_short = target_url.split('?')[0]
         model_tag = f" | Модель: {model_name}" if model_name else ""
-        auth_tag = "✓ (Ключ передан)" if has_key else "✗ (КЛЮЧ ОТСУТСТВУЕТ!)"
-        print(f"[{now}] [LLM Прокси] {self.command} {target_short}{model_tag} | Auth: {auth_tag}")
+        stream_tag = " | stream" if wants_stream else ""
+        auth_tag = "✓ (Ключ передан)" if has_key else "✗ (ключа нет)"
+        log('LLM Прокси', f"{self.command} {target_short}{model_tag}{stream_tag} | Auth: {auth_tag}")
 
         t0 = time.time()
         try:
             req = urllib.request.Request(target_url, data=body, headers=forward_headers, method=self.command)
-            with urllib.request.urlopen(req, context=SSL_CTX, timeout=180) as resp:
-                status = resp.status
-                resp_headers = resp.headers
-                resp_data = resp.read()
-
-                # Automatically decompress gzip if the upstream server compressed it
-                enc = resp_headers.get('Content-Encoding', '').lower()
-                if enc == 'gzip' or resp_data[:2] == b'\x1f\x8b':
-                    try:
-                        resp_data = gzip.decompress(resp_data)
-                    except Exception:
-                        pass
-
-                elapsed = round(time.time() - t0, 2)
-                now_resp = time.strftime('%H:%M:%S')
-                print(f"[{now_resp}] [LLM Прокси] -> Ответ получен за {elapsed}с: HTTP {status} ({len(resp_data)} байт)")
-                self.send_response(status)
-                self.send_header('Content-Type', 'application/json; charset=utf-8')
-                self.end_headers()
-                self.wfile.write(resp_data)
+            with urllib.request.urlopen(req, context=SSL_CTX, timeout=UPSTREAM_TIMEOUT) as resp:
+                self.relay_response(resp, t0)
         except urllib.error.HTTPError as e:
             elapsed = round(time.time() - t0, 2)
-            now_err = time.strftime('%H:%M:%S')
-            err_data = e.read()
-            enc = e.headers.get('Content-Encoding', '').lower()
-            if enc == 'gzip' or err_data[:2] == b'\x1f\x8b':
-                try:
-                    err_data = gzip.decompress(err_data)
-                except Exception:
-                    pass
+            err_data = maybe_gunzip(e.read(), (e.headers.get('Content-Encoding') or '').lower())
+            log('LLM Прокси', f"-> Ошибка API за {elapsed}с: HTTP {e.code}")
 
-            print(f"[{now_err}] [LLM Прокси] -> Ошибка API за {elapsed}с: HTTP {e.code}")
-
-            # Friendly message for 403 Forbidden with HTML Cloudflare/Vercel page
-            if e.code == 403 and (b'<!DOCTYPE' in err_data or b'<html' in err_data):
-                self.send_response(403)
-                self.send_header('Content-Type', 'application/json; charset=utf-8')
-                self.end_headers()
-                friendly_err = json.dumps({
-                    "error": {
-                        "message": "Nano-GPT отклонил запрос (403 Forbidden). Проверьте: 1) Введен ли API-ключ в окне «⚙️ Настройки API». 2) Есть ли средства на балансе nano-gpt.com."
-                    }
-                })
-                self.wfile.write(friendly_err.encode('utf-8'))
+            # Cloudflare / gateway HTML pages are useless to the UI: replace with a readable message
+            head = err_data[:512].lower()
+            if b'<!doctype' in head or b'<html' in head:
+                hint = (" Проверьте API-ключ в «Настройках API» и баланс у провайдера."
+                        if e.code in (401, 403) else " Сервер провайдера временно недоступен или блокирует запрос.")
+                self.send_json(e.code, f"Сервер вернул HTML-страницу ошибки (HTTP {e.code}).{hint}")
                 return
 
             self.send_response(e.code)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Content-Length', str(len(err_data)))
             self.end_headers()
             self.wfile.write(err_data)
         except (TimeoutError, socket.timeout):
-            self.send_response(504)
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.end_headers()
-            err_msg = json.dumps({"error": {"message": "Превышено время ожидания ответа (таймаут 180 сек). Попробуйте перевести это поле отдельно."}})
-            self.wfile.write(err_msg.encode('utf-8'))
+            self.send_json(504, f"Превышено время ожидания ответа ({UPSTREAM_TIMEOUT} с без данных от сервера).")
+        except urllib.error.URLError as e:
+            if isinstance(e.reason, ssl.SSLError):
+                self.send_json(502, f"Ошибка проверки TLS-сертификата: {e.reason}. "
+                                    "Если вы за корпоративным прокси, запустите: python run.py --insecure")
+            elif isinstance(e.reason, (TimeoutError, socket.timeout)):
+                self.send_json(504, f"Превышено время ожидания ответа ({UPSTREAM_TIMEOUT} с).")
+            else:
+                self.send_json(502, f"Не удалось подключиться к {target_short}: {e.reason}")
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            log('LLM Прокси', "-> Клиент прервал запрос")
         except Exception as e:
-            self.send_response(502)
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.end_headers()
             err_detail = str(e).strip() or repr(e)
-            err_msg = json.dumps({"error": {"message": f"Proxy connection error: {err_detail}"}})
-            self.wfile.write(err_msg.encode('utf-8'))
+            try:
+                self.send_json(502, f"Proxy connection error: {err_detail}")
+            except OSError:
+                pass
+
+    def relay_response(self, resp, t0):
+        content_type = resp.headers.get('Content-Type', 'application/json')
+        encoding = (resp.headers.get('Content-Encoding') or '').lower()
+
+        if 'text/event-stream' in content_type and encoding != 'gzip':
+            # Stream pass-through: no Content-Length, connection closes at the end (HTTP/1.0)
+            self.send_response(resp.status)
+            self.send_header('Content-Type', content_type)
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            total = 0
+            while True:
+                chunk = resp.read1(16384)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+                total += len(chunk)
+            log('LLM Прокси', f"-> Поток завершён за {round(time.time() - t0, 2)}с: HTTP {resp.status} ({total} байт)")
+            return
+
+        data = maybe_gunzip(resp.read(), encoding)
+        log('LLM Прокси', f"-> Ответ получен за {round(time.time() - t0, 2)}с: HTTP {resp.status} ({len(data)} байт)")
+        self.send_response(resp.status)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_request(self, code='-', size='-'):
+        # Proxy calls have their own log lines; static files are logged only on errors
+        if self.path.startswith('/api-proxy'):
+            return
+        try:
+            if int(code) < 400:
+                return
+        except (TypeError, ValueError):
+            pass
+        log('HTTP', f'"{self.requestline}" {code}')
 
     def log_message(self, format, *args):
-        if not self.path.startswith('/api-proxy'):
-            now = time.strftime('%H:%M:%S')
-            msg = format % args
-            print(f"[{now}] [HTTP] {msg}")
+        log('HTTP', format % args)
+
 
 def find_free_port(start_port=8000, max_attempts=20):
     for p in range(start_port, start_port + max_attempts):
@@ -230,32 +286,43 @@ def find_free_port(start_port=8000, max_attempts=20):
                 continue
     return start_port
 
-def main():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    os.chdir(script_dir)
 
-    port = find_free_port(8000)
+def main():
+    global SSL_CTX
+
+    parser = argparse.ArgumentParser(description='AI Card Translator: локальный сервер + CORS-прокси')
+    parser.add_argument('--port', type=int, default=0, help='порт (по умолчанию первый свободный начиная с 8000)')
+    parser.add_argument('--no-browser', action='store_true', help='не открывать браузер автоматически')
+    parser.add_argument('--insecure', action='store_true',
+                        help='не проверять TLS-сертификаты (только для корпоративных сетей с подменой сертификатов)')
+    args = parser.parse_args()
+
+    if args.insecure:
+        SSL_CTX = ssl._create_unverified_context()
+
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+    port = args.port or find_free_port(8000)
     url = f"http://127.0.0.1:{port}"
+    server = ThreadingHTTPServer(('127.0.0.1', port), ProxyAndStaticServer)
 
     print("=" * 60)
     print(" AI Character Card Translator & Editor")
     print(f" Сервер запущен: {url}")
-    print(" Встроенный многопоточный CORS-прокси активен на /api-proxy")
-    print(" Открываем страницу в браузере...")
+    print(" CORS-прокси для LLM API активен на /api-proxy")
+    if args.insecure:
+        print(" ВНИМАНИЕ: проверка TLS-сертификатов отключена (--insecure)")
     print(" Для остановки закройте это окно или нажмите Ctrl+C")
-    print("=" * 60)
+    print("=" * 60, flush=True)
 
-    def open_browser():
-        time.sleep(0.5)
-        webbrowser.open(url)
+    if not args.no_browser:
+        threading.Timer(0.5, webbrowser.open, args=(url,)).start()
 
-    threading.Thread(target=open_browser, daemon=True).start()
-
-    server = ThreadingHTTPServer(('127.0.0.1', port), ProxyAndStaticServer)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nСервер остановлен.")
+
 
 if __name__ == '__main__':
     main()

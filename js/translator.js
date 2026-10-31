@@ -1,49 +1,31 @@
 /**
  * Translator Module
- * Connects to Nano-GPT, OpenRouter, Ollama, LM Studio, and generic OpenAI-compatible endpoints.
- * Tailored specifically for AI Character Cards (preserves {{char}}, {{user}}, <START>, markdown, slang).
- * Includes auto-proxy routing to bypass CORS for Nano-GPT and third-party APIs.
- * Supports both full-card context-aware translation in 1 request and single field translation.
+ * Talks to Nano-GPT, OpenRouter, Ollama, LM Studio and any OpenAI-compatible endpoint.
+ *
+ * Translation pipeline:
+ *   1. analyzeCardContext — "passport" of the character (gender, address form, tone, glossary).
+ *   2. buildTranslationUnits — every translatable piece of the card becomes a unit with a stable id.
+ *   3. translateUnits — units are packed into batches sized by token budget, each batch is sent
+ *      as <field id="..."> blocks; truncated or missing units are retried one by one.
+ *   4. applyTranslations — results are written back into card data (lorebook keys are additive).
  */
 
-export const DEFAULT_PROMPT_RU = `Ты — профессиональный литературный переводчик и эксперт по карточкам персонажей для текстовых ролевых игр (SillyTavern, Chub, TavernAI).
-Твоя задача — качественно, выразительно и стилистически точно перевести текст карточки персонажа на русский язык с сохранением контекста роли.
-
-КРИТИЧЕСКИ ВАЖНЫЕ ПРАВИЛА:
-1. СОХРАНЯЙ ВСЕ МАКРОСЫ И ПЕРЕМЕННЫЕ БЕЗ ИЗМЕНЕНИЙ:
-   - {{char}}, {{user}}, {{original}}, <START>, <USER>, <BOT>, XML-теги вроде <guidelines>, <personality> НЕЛЬЗЯ переводить или менять регистр!
-   - Не заменяй {{char}} на имя персонажа! Оставляй именно {{char}} и {{user}}!
-   - Макросы {{sub}} и {{obj}} (из JanitorAI) заменяй на {{user}}!
-2. СОХРАНЯЙ СТРУКТУРУ И ФОРМАТИРОВАНИЕ:
-   - Действия в звездочках *действие* должны оставаться в звездочках *действие*.
-   - Прямая речь в кавычках должна оставаться в кавычках.
-   - Разделители реплик <START> должны оставаться строго на своих строках.
-   - Сохраняй абзацы, переносы строк, списки, квадратные скобки [Scenario: ...], W++ атрибуты если есть.
-3. ПЕРЕДАЧА СТИЛЯ И ХАРАКТЕРА:
-   - Учитывай пол персонажа, возраст, манеру речи и характер. Используй правильные окончания глаголов (мужской/женский род).
-   - Живой литературный русский язык без англицизмов-калек, естественные диалоги.
-4. ФОРМАТ ОТВЕТА:
-   - Выводи ТОЛЬКО готовый переведенный текст.
-   - НИКАКИХ предисловий, пояснений, кавычек вокруг всего ответа или фраз вроде "Вот перевод:".`;
+import { TEXT_FIELDS, countStats } from './card-parser.js';
 
 export const PROVIDER_PRESETS = {
   nanogpt: {
     id: 'nanogpt',
-    name: 'Nano-GPT (nano-gpt.com)',
+    name: 'Nano-GPT',
     baseUrl: 'https://nano-gpt.com/api/v1',
     defaultModel: 'deepseek/deepseek-v4.1-flash',
     popularModels: [
-      { id: 'deepseek/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash (Сверхбыстрый)' },
-      { id: 'deepseek/deepseek-chat', name: 'DeepSeek V3 (Рекомендуется)' },
-      { id: 'deepseek/deepseek-r1', name: 'DeepSeek R1 (Рассуждающий)' },
-      { id: 'gpt-4o-mini', name: 'GPT-4o Mini' },
-      { id: 'chatgpt-4o-latest', name: 'GPT-4o' },
-      { id: 'claude-3-5-sonnet-20241022', name: 'Claude 3.5 Sonnet' },
-      { id: 'meta-llama/llama-3.3-70b-instruct', name: 'Llama 3.3 70B' },
-      { id: 'qwen/qwen-2.5-72b-instruct', name: 'Qwen 2.5 72B' }
+      { id: 'deepseek/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash' },
+      { id: 'deepseek/deepseek-chat', name: 'DeepSeek V3' },
+      { id: 'deepseek/deepseek-r1', name: 'DeepSeek R1 (рассуждающий)' },
+      { id: 'gpt-4o-mini', name: 'GPT-4o Mini' }
     ],
     needsKey: true,
-    hint: 'API-ключ Nano-GPT (начинается на sk-...). Запросы автоматически идут через локальный прокси без блокировки CORS.'
+    hint: 'API-ключ Nano-GPT (sk-...). Запросы идут через локальный прокси run.py. Полный список моделей — кнопка «Обновить список».'
   },
   openrouter: {
     id: 'openrouter',
@@ -51,103 +33,80 @@ export const PROVIDER_PRESETS = {
     baseUrl: 'https://openrouter.ai/api/v1',
     defaultModel: 'deepseek/deepseek-chat',
     popularModels: [
-      { id: 'deepseek/deepseek-chat', name: 'DeepSeek V3 (Быстрый & Дешевый)' },
-      { id: 'deepseek/deepseek-r1', name: 'DeepSeek R1 (Рассуждающий)' },
-      { id: 'anthropic/claude-3.5-sonnet', name: 'Claude 3.5 Sonnet (Высшее качество)' },
-      { id: 'google/gemini-2.5-flash', name: 'Gemini 2.5 Flash (Сверхбыстрый)' },
-      { id: 'meta-llama/llama-3.3-70b-instruct', name: 'Llama 3.3 70B Instruct' },
-      { id: 'qwen/qwen-2.5-72b-instruct', name: 'Qwen 2.5 72B Instruct' },
-      { id: 'openai/gpt-4o-mini', name: 'GPT-4o Mini' }
+      { id: 'deepseek/deepseek-chat', name: 'DeepSeek V3 (быстрый и дешёвый)' },
+      { id: 'deepseek/deepseek-r1', name: 'DeepSeek R1 (рассуждающий)' },
+      { id: 'anthropic/claude-sonnet-4.5', name: 'Claude Sonnet 4.5' },
+      { id: 'google/gemini-2.5-flash', name: 'Gemini 2.5 Flash' },
+      { id: 'google/gemini-2.5-pro', name: 'Gemini 2.5 Pro' },
+      { id: 'qwen/qwen3-235b-a22b', name: 'Qwen3 235B' }
     ],
     needsKey: true,
-    hint: 'Требуется API-ключ OpenRouter (сохраняется только в вашем браузере).'
+    hint: 'Требуется API-ключ OpenRouter. Полный список моделей — кнопка «Обновить список».'
   },
   ollama: {
     id: 'ollama',
-    name: 'Ollama (Локально)',
+    name: 'Ollama (локально)',
     baseUrl: 'http://localhost:11434/v1',
     defaultModel: 'qwen2.5:latest',
     popularModels: [
-      { id: 'qwen2.5:latest', name: 'Qwen 2.5 (Отличный русский язык)' },
+      { id: 'qwen2.5:latest', name: 'Qwen 2.5' },
       { id: 'llama3.1:latest', name: 'Llama 3.1' },
       { id: 'mistral:latest', name: 'Mistral' }
     ],
     needsKey: false,
-    hint: 'Для работы в браузере запустите Ollama с CORS: set OLLAMA_ORIGINS=* && ollama serve'
+    hint: 'Для работы из браузера запустите Ollama с CORS: set OLLAMA_ORIGINS=* && ollama serve'
   },
   lmstudio: {
     id: 'lmstudio',
-    name: 'LM Studio (Локально)',
+    name: 'LM Studio (локально)',
     baseUrl: 'http://localhost:1234/v1',
     defaultModel: '',
     popularModels: [],
     needsKey: false,
-    hint: 'В LM Studio включите локальный сервер (Local Server) и переключатель Enable CORS в настройках.'
+    hint: 'В LM Studio включите Local Server и переключатель Enable CORS.'
   },
   custom: {
     id: 'custom',
-    name: 'Пользовательский (OpenAI-совместимый)',
+    name: 'OpenAI-совместимый',
     baseUrl: 'http://localhost:5001/v1',
     defaultModel: '',
     popularModels: [],
     needsKey: false,
-    hint: 'Подходит для Nano-GPT, KoboldCpp, vLLM, TabbyAPI, llama.cpp server.'
+    hint: 'KoboldCpp, vLLM, TabbyAPI, llama.cpp server и любые OpenAI-совместимые API.'
   }
 };
 
-/**
- * Resolves whether a URL should go through local CORS proxy
- */
-function resolveUrl(targetUrl, provider = '') {
-  const isLocalServer = window.location.protocol.startsWith('http') && 
-    (window.location.hostname === '127.0.0.1' ||
-     window.location.hostname === 'localhost' ||
-     window.location.hostname === '::1' ||
-     window.location.hostname === '[::1]');
+const SETTINGS_KEY = 'chara_translator_settings';
 
-  if (!isLocalServer) return targetUrl;
-
-  const cleanTarget = targetUrl.trim();
-
-  // Nano-GPT and non-OpenRouter external endpoints need CORS proxy
-  if (
-    provider === 'nanogpt' ||
-    cleanTarget.includes('nano-gpt.com') ||
-    (!cleanTarget.includes('openrouter.ai') &&
-     !cleanTarget.includes('localhost') &&
-     !cleanTarget.includes('127.0.0.1') &&
-     !cleanTarget.includes('[::1]'))
-  ) {
-    return `/api-proxy?target=${encodeURIComponent(cleanTarget)}`;
-  }
-
-  return cleanTarget;
-}
+export const DEFAULT_SETTINGS = {
+  provider: 'nanogpt',
+  baseUrl: PROVIDER_PRESETS.nanogpt.baseUrl,
+  apiKey: '',
+  model: PROVIDER_PRESETS.nanogpt.defaultModel,
+  temperature: 0.3,
+  maxTokens: 8192,
+  stream: true,
+  translateTags: true,
+  extraInstructions: ''
+};
 
 /**
  * Loads saved translator settings from localStorage
  */
 export function loadSettings() {
-  const defaults = {
-    provider: 'nanogpt',
-    baseUrl: PROVIDER_PRESETS.nanogpt.baseUrl,
-    apiKey: '',
-    model: PROVIDER_PRESETS.nanogpt.defaultModel,
-    targetLang: 'ru',
-    systemPrompt: DEFAULT_PROMPT_RU,
-    temperature: 0.3,
-    maxTokens: 8192
-  };
-
   try {
-    const saved = localStorage.getItem('chara_translator_settings');
+    const saved = localStorage.getItem(SETTINGS_KEY);
     if (saved) {
-      return { ...defaults, ...JSON.parse(saved) };
+      const parsed = JSON.parse(saved);
+      // The old free-form "systemPrompt" setting is superseded by built-in prompts + extraInstructions
+      delete parsed.systemPrompt;
+      delete parsed.targetLang;
+      return { ...DEFAULT_SETTINGS, ...parsed };
     }
   } catch (e) {
     console.warn('Failed to read settings from localStorage', e);
   }
-  return defaults;
+  return { ...DEFAULT_SETTINGS };
 }
 
 /**
@@ -155,98 +114,265 @@ export function loadSettings() {
  */
 export function saveSettings(settings) {
   try {
-    localStorage.setItem('chara_translator_settings', JSON.stringify(settings));
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
   } catch (e) {
     console.error('Failed to save settings to localStorage', e);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Transport
+// ---------------------------------------------------------------------------
+
+export class LlmError extends Error {
+  constructor(message, status = 0) {
+    super(message);
+    this.name = 'LlmError';
+    this.status = status;
+  }
+}
+
+const LOCAL_HOSTNAMES = ['127.0.0.1', 'localhost', '::1', '[::1]'];
+
+function isServedByLocalProxy() {
+  return typeof window !== 'undefined' &&
+    window.location.protocol.startsWith('http') &&
+    LOCAL_HOSTNAMES.includes(window.location.hostname);
+}
+
+function proxyUrl(targetUrl) {
+  return `/api-proxy?target=${encodeURIComponent(targetUrl)}`;
+}
+
+/**
+ * Local servers and OpenRouter (which sends CORS headers) are called directly,
+ * everything else goes through the run.py proxy when it is available.
+ */
+function shouldUseProxy(targetUrl) {
+  if (!isServedByLocalProxy()) return false;
+  let host;
+  try {
+    host = new URL(targetUrl).hostname;
+  } catch {
+    return false;
+  }
+  if (LOCAL_HOSTNAMES.includes(host)) return false;
+  return !host.endsWith('openrouter.ai');
+}
+
+function isNetworkError(err) {
+  return err?.name === 'TypeError' || /Failed to fetch|NetworkError|network error|Load failed/i.test(err?.message || '');
+}
+
+async function fetchWithProxyFallback(targetUrl, init) {
+  const useProxy = shouldUseProxy(targetUrl);
+  try {
+    return await fetch(useProxy ? proxyUrl(targetUrl) : targetUrl, init);
+  } catch (err) {
+    if (init.signal?.aborted) throw err;
+    if (!useProxy && isServedByLocalProxy() && isNetworkError(err)) {
+      console.warn(`Direct request to ${targetUrl} failed (${err.message}). Retrying via /api-proxy...`);
+      return fetch(proxyUrl(targetUrl), init);
+    }
+    if (isNetworkError(err)) {
+      throw new LlmError(isServedByLocalProxy()
+        ? `Не удалось подключиться к ${targetUrl}. Проверьте адрес эндпоинта и что сервер запущен.`
+        : 'Сетевая ошибка или блокировка CORS. Запустите приложение через start.bat / run.py — он включает прокси для API.');
+    }
+    throw err;
+  }
+}
+
+function buildHeaders(settings) {
+  const headers = {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json, text/event-stream'
+  };
+  const key = (settings.apiKey || '').trim();
+  if (key) {
+    headers['Authorization'] = `Bearer ${key}`;
+    headers['x-api-key'] = key;
+  }
+  if (settings.provider === 'openrouter') {
+    headers['HTTP-Referer'] = (typeof window !== 'undefined' && window.location.origin) || 'http://localhost';
+    headers['X-Title'] = 'AI Character Card Translator';
+  }
+  return headers;
+}
+
+function ensureApiKey(settings) {
+  const preset = PROVIDER_PRESETS[settings.provider];
+  if (preset?.needsKey && !(settings.apiKey || '').trim()) {
+    throw new LlmError(`API-ключ не задан. Откройте «Настройки API» и вставьте ключ ${preset.name}.`);
+  }
+}
+
+function extractErrorMessage(text) {
+  try {
+    const json = JSON.parse(text);
+    const err = json.error;
+    if (typeof err === 'string') return err;
+    return err?.message || json.message || json.detail || text;
+  } catch {
+    return text;
+  }
+}
+
+function numberOr(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
 }
 
 /**
  * Fetches models list from the configured endpoint
  */
 export async function fetchAvailableModels(baseUrl, apiKey, provider, signal = null) {
-  const rawUrl = `${baseUrl.replace(/\/+$/, '')}/models`;
-  const fetchUrl = resolveUrl(rawUrl, provider);
-
-  const headers = {
-    'Content-Type': 'application/json',
-    'Accept': 'application/json'
-  };
-
-  if (apiKey) {
-    const trimmedKey = apiKey.trim();
-    headers['Authorization'] = `Bearer ${trimmedKey}`;
-    headers['x-api-key'] = trimmedKey;
-  }
-  if (provider === 'openrouter') {
-    headers['HTTP-Referer'] = window.location.origin || 'http://localhost';
-    headers['X-Title'] = 'AI Character Card Translator';
-  }
-
+  const url = `${baseUrl.replace(/\/+$/, '')}/models`;
+  let response;
   try {
-    const response = await fetch(fetchUrl, {
+    response = await fetchWithProxyFallback(url, {
       method: 'GET',
-      headers,
+      headers: buildHeaders({ apiKey, provider }),
       signal
     });
-
-    if (!response.ok) {
-      let errText = '';
-      try {
-        const errJson = await response.json();
-        errText = errJson.error?.message || JSON.stringify(errJson);
-      } catch {
-        errText = await response.text();
-      }
-      throw new Error(`Ошибка API (${response.status}): ${errText.slice(0, 150)}`);
-    }
-
-    const data = await response.json();
-    if (Array.isArray(data.data)) {
-      return data.data.map(m => ({ id: m.id, name: m.name || m.id }));
-    } else if (Array.isArray(data)) {
-      return data.map(m => ({ id: m.id || m.name, name: m.name || m.id }));
-    }
-    return [];
   } catch (err) {
     if (err.name === 'AbortError') {
-      throw new Error('Таймаут запроса моделей (10 сек). Выберите готовую модель из списка ниже.');
+      throw new Error('Таймаут запроса моделей (10 сек). Выберите модель из списка или введите вручную.');
     }
-    // If direct fetch failed with CORS / NetworkError, retry via proxy
-    const isNetworkOrCors = err.name === 'TypeError' ||
-      err.message.includes('Failed to fetch') ||
-      err.message.includes('NetworkError');
-
-    if (!fetchUrl.startsWith('/api-proxy') && isNetworkOrCors) {
-      try {
-        const proxyUrl = `/api-proxy?target=${encodeURIComponent(rawUrl)}`;
-        const retryRes = await fetch(proxyUrl, { method: 'GET', headers, signal });
-        if (retryRes.ok) {
-          const d = await retryRes.json();
-          if (Array.isArray(d.data)) return d.data.map(m => ({ id: m.id, name: m.name || m.id }));
-          if (Array.isArray(d)) return d.map(m => ({ id: m.id || m.name, name: m.name || m.id }));
-        } else {
-          let errText = '';
-          try {
-            const errJson = await retryRes.json();
-            errText = errJson.error?.message || JSON.stringify(errJson);
-          } catch {
-            errText = await retryRes.text();
-          }
-          throw new Error(`Ошибка API (${retryRes.status}): ${errText.slice(0, 150)}`);
-        }
-      } catch (retryErr) {
-        if (retryErr.message?.startsWith('Ошибка API')) throw retryErr;
-      }
-    }
-
-    let msg = err.message;
-    if (msg.includes('Failed to fetch') || msg.includes('NetworkError') || err.name === 'TypeError') {
-      msg = 'Не удалось подключиться к эндпоинту. Проверьте запущен ли start.bat / run.py или выберите модель из списка вручную.';
-    }
-    throw new Error(msg);
+    throw err;
   }
+
+  const text = await response.text();
+  if (!response.ok) {
+    throw new LlmError(`Ошибка API (${response.status}): ${extractErrorMessage(text).slice(0, 200)}`, response.status);
+  }
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new LlmError('Эндпоинт вернул не JSON на запрос /models');
+  }
+  const list = Array.isArray(data.data) ? data.data : (Array.isArray(data) ? data : (Array.isArray(data.models) ? data.models : []));
+  return list
+    .map(m => (typeof m === 'string' ? { id: m, name: m } : { id: m.id || m.name, name: m.name || m.id }))
+    .filter(m => m.id)
+    .sort((a, b) => String(a.name).localeCompare(String(b.name)));
 }
+
+/**
+ * Reads an OpenAI-style SSE stream, accumulating content/reasoning deltas.
+ */
+async function readEventStream(response, onDelta) {
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+  let buffer = '';
+  let content = '';
+  let reasoning = '';
+  let finishReason = null;
+
+  const handleLine = (rawLine) => {
+    const line = rawLine.trim();
+    if (!line.startsWith('data:')) return;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === '[DONE]') return;
+    let json;
+    try {
+      json = JSON.parse(payload);
+    } catch {
+      return;
+    }
+    if (json.error) {
+      throw new LlmError(`Ошибка API: ${json.error.message || JSON.stringify(json.error)}`);
+    }
+    const choice = json.choices?.[0];
+    if (!choice) return;
+    const delta = choice.delta || choice.message || {};
+    if (delta.content) {
+      content += delta.content;
+      onDelta?.(content);
+    }
+    const r = delta.reasoning_content || delta.reasoning;
+    if (typeof r === 'string') reasoning += r;
+    if (choice.finish_reason) finishReason = choice.finish_reason;
+  };
+
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += value;
+    let nl;
+    while ((nl = buffer.indexOf('\n')) >= 0) {
+      handleLine(buffer.slice(0, nl));
+      buffer = buffer.slice(nl + 1);
+    }
+  }
+  if (buffer) handleLine(buffer);
+  return { content, reasoning, finishReason };
+}
+
+/**
+ * Single chat completion request. Streams when enabled (keeps long requests alive and gives progress).
+ * Returns { content, finishReason, truncated }.
+ */
+export async function chatCompletion({ settings, messages, temperature, maxTokens, signal = null, onDelta = null }) {
+  ensureApiKey(settings);
+  const endpoint = `${settings.baseUrl.replace(/\/+$/, '')}/chat/completions`;
+  const stream = settings.stream !== false;
+  const requestBody = {
+    model: settings.model || PROVIDER_PRESETS[settings.provider]?.defaultModel || 'deepseek/deepseek-chat',
+    messages,
+    temperature: numberOr(temperature, numberOr(settings.temperature, 0.3)),
+    max_tokens: Math.max(256, Math.round(numberOr(maxTokens, numberOr(settings.maxTokens, 8192)))),
+    stream
+  };
+
+  const response = await fetchWithProxyFallback(endpoint, {
+    method: 'POST',
+    headers: buildHeaders(settings),
+    body: JSON.stringify(requestBody),
+    signal
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new LlmError(`Ошибка API (${response.status}): ${extractErrorMessage(text).slice(0, 400) || response.statusText}`, response.status);
+  }
+
+  let content = '';
+  let reasoning = '';
+  let finishReason = null;
+  const contentType = response.headers.get('content-type') || '';
+
+  if (contentType.includes('text/event-stream') && response.body) {
+    ({ content, reasoning, finishReason } = await readEventStream(response, onDelta));
+  } else {
+    const text = await response.text();
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      throw new LlmError(`Ошибка разбора ответа (${response.status}): ${text.slice(0, 200)}`);
+    }
+    if (json.error) {
+      throw new LlmError(`Ошибка API: ${json.error.message || JSON.stringify(json.error)}`);
+    }
+    const choice = json.choices?.[0];
+    content = choice?.message?.content ?? choice?.text ?? '';
+    reasoning = choice?.message?.reasoning_content || choice?.message?.reasoning || '';
+    finishReason = choice?.finish_reason || null;
+    onDelta?.(content);
+  }
+
+  const cleaned = cleanModelPreamble(content);
+  if (!cleaned && reasoning) {
+    throw new LlmError('Модель вернула только рассуждения без ответа — скорее всего, не хватило Max Tokens. Увеличьте лимит в настройках или выберите модель без reasoning.');
+  }
+  return { content: cleaned, finishReason, truncated: finishReason === 'length' };
+}
+
+// ---------------------------------------------------------------------------
+// Text post-processing
+// ---------------------------------------------------------------------------
 
 /**
  * Strips reasoning (<think>...</think>), code block fences, and introductory boilerplate
@@ -272,905 +398,595 @@ export function cleanModelPreamble(text) {
     res = res.replace(/\n?```\s*$/, '').trim();
   }
 
-  // Remove common introductory phrases if still present inside block
-  res = res.replace(chatOpener, '').trim();
-
-  return res;
+  return res.replace(chatOpener, '').trim();
 }
 
 /**
- * Validates and repairs corrupted macros ({{char}}, {{user}}, {{original}}) and <START> tags
+ * Repairs macros that models tend to translate or mangle: {{персонаж}} → {{char}}, {user} → {{user}}, [START] → <START>
  */
 export function repairMacrosAndTags(text) {
   if (!text || typeof text !== 'string') return '';
   let res = text;
 
-  // Normalize char macros: {{char}}, {char}, {{{char}}}, {{персонаж}}, {{персонажа}}, {{бот}}, {{перс}}, etc.
-  res = res.replace(/\{{1,3}\s*(?:char|персонаж[а-яё]*|бот[а-яё]*|перс[а-яё]*)\s*\}{1,3}/gi, '{{char}}');
-  // Normalize user macros: {{user}}, {user}, {{{user}}}, {{sub}}, {{obj}}, {{пользователь}}, {{пользователя}}, {{юзер}}, {{игрок}}, etc.
-  res = res.replace(/\{{1,3}\s*(?:user|sub|obj|пользовател[а-яё]*|юзер[а-яё]*|игрок[а-яё]*)\s*\}{1,3}/gi, '{{user}}');
-  // Normalize original macro: {{original}}
-  res = res.replace(/\{{1,3}\s*original\s*\}{1,3}/gi, '{{original}}');
-
-  // Normalize <START> dialogue separators: <start>, [START], <старт>, < START >, etc.
+  res = res.replace(/\{{1,3}\s*(?:char|персонаж(?:а|у|ем|е)?|бот(?:а|у|ом|е)?)\s*\}{1,3}/gi, '{{char}}');
+  res = res.replace(/\{{1,3}\s*(?:user|sub|obj|пользовател(?:ь|я|ю|ем|е)|юзер(?:а|у|ом|е)?|игрок(?:а|у|ом|е)?)\s*\}{1,3}/gi, '{{user}}');
+  res = res.replace(/\{{1,3}\s*(?:persona|персона)\s*\}{1,3}/gi, '{{persona}}');
+  res = res.replace(/\{{1,3}\s*(?:original|оригинал)\s*\}{1,3}/gi, '{{original}}');
   res = res.replace(/(?:\[\s*START\s*\]|<\s*start\s*>|\[\s*старт\s*\]|<\s*старт\s*>)/gi, '<START>');
 
   return res;
 }
 
-/**
- * Balances action asterisks (*) so italics never leak into subsequent text.
- * Safely ignores markdown horizontal rules (***) and list bullet points (* item).
- */
-export function balanceAsterisks(text) {
-  if (!text || typeof text !== 'string') return '';
-  
-  // Exclude standalone horizontal rules (*** or * * *) and markdown list bullet points (* item)
-  const cleanedForCount = text
-    .replace(/^\s*(?:\*\s*){3,}\s*$/gm, '') // scene breaks / horizontal rules
-    .replace(/^\s*\*\s+/gm, '');          // list bullets
+function countAsterisks(text) {
+  // Ignore scene breaks (*** / * * *) and list bullets (* item)
+  const cleaned = String(text || '')
+    .replace(/^\s*(?:\*\s*){3,}\s*$/gm, '')
+    .replace(/^\s*\*\s+/gm, '');
+  return (cleaned.match(/\*/g) || []).length;
+}
 
-  const count = (cleanedForCount.match(/\*/g) || []).length;
-  if (count % 2 !== 0) {
-    return text.trimEnd() + '*';
+function countMacros(text) {
+  const counts = new Map();
+  for (const m of String(text || '').matchAll(/\{\{\s*([^{}]+?)\s*\}\}|<START>/gi)) {
+    const key = m[1] ? `{{${m[1].toLowerCase()}}}` : '<START>';
+    counts.set(key, (counts.get(key) || 0) + 1);
   }
-  return text;
+  return counts;
 }
 
 /**
- * Parses XML tag format (e.g. <description>...</description>)
- * Immune to unescaped quotes, apostrophes, attributes, and dialogue formatting.
+ * Compares a translation with its source and returns human-readable warnings
+ * (lost macros, unpaired asterisks, suspiciously short output). Never modifies the text.
+ */
+export function checkFormatting(original, translated) {
+  const warnings = [];
+  const src = String(original || '');
+  const dst = String(translated || '');
+  if (!src.trim()) return warnings;
+  if (!dst.trim()) return ['Перевод пустой'];
+
+  const srcMacros = countMacros(src);
+  const dstMacros = countMacros(dst);
+  for (const [macro, n] of srcMacros) {
+    const m = dstMacros.get(macro) || 0;
+    if (m < n) warnings.push(`${macro}: было ${n}, стало ${m}`);
+  }
+
+  if (countAsterisks(src) % 2 === 0 && countAsterisks(dst) % 2 === 1) {
+    warnings.push('Непарная звёздочка *');
+  }
+
+  if (src.length > 200 && dst.length < src.length * 0.45) {
+    warnings.push('Перевод подозрительно короткий — возможно, обрезан');
+  }
+  return warnings;
+}
+
+/**
+ * Backward-compatible no-op balance check: returns the text unchanged.
+ * Appending asterisks blindly corrupted valid markdown (**bold**), so this is now reported by checkFormatting instead.
+ */
+export function balanceAsterisks(text) {
+  return typeof text === 'string' ? text : '';
+}
+
+/**
+ * Extracts <field id="...">...</field> blocks from a model response.
+ * A block without a closing tag runs until the next <field or the end; it is reported in `unclosed`.
+ */
+export function extractTaggedFields(text) {
+  const fields = {};
+  const unclosed = [];
+  if (!text || typeof text !== 'string') return { fields, unclosed };
+
+  const openRe = /<field\s+[^>]*?id\s*=\s*["']([^"']+)["'][^>]*>/gi;
+  const opens = [];
+  let m;
+  while ((m = openRe.exec(text)) !== null) {
+    opens.push({ id: m[1].trim(), start: m.index, contentStart: openRe.lastIndex });
+  }
+
+  for (let i = 0; i < opens.length; i++) {
+    const { id, contentStart } = opens[i];
+    const nextOpen = i + 1 < opens.length ? opens[i + 1].start : text.length;
+    const segment = text.slice(contentStart, nextOpen);
+    const closeIdx = segment.search(/<\/field\s*>/i);
+    let content;
+    if (closeIdx >= 0) {
+      content = segment.slice(0, closeIdx);
+    } else {
+      content = segment;
+      unclosed.push(id);
+    }
+    content = content.replace(/^\s*<!\[CDATA\[([\s\S]*?)\]\]>\s*$/i, '$1');
+    // Trim only the newlines added around the block, keep inner formatting
+    content = content.replace(/^\s*\n/, '').replace(/\n\s*$/, '').trim();
+    if (fields[id] === undefined) fields[id] = content;
+  }
+  return { fields, unclosed };
+}
+
+/**
+ * Legacy helper: parses <tag>...</tag> pairs (used by older tests / tools)
  */
 export function parseXmlFields(responseText) {
   const result = {};
   if (!responseText || typeof responseText !== 'string') return result;
-
-  // Match closed tags: <tag_name [attributes]>content</tag_name>
-  // Case-insensitive, supports tags with hyphens or underscores
   const tagRegex = /<([a-zA-Z0-9_-]+)(?:\s+[^>]*)?>([\s\S]*?)<\/\1>/gi;
   let match;
-  let lastClosedEnd = 0;
   while ((match = tagRegex.exec(responseText)) !== null) {
-    const rawTag = match[1];
-    const normTag = rawTag.toLowerCase().replace('-', '_');
-    let content = match[2].trim();
-    // Strip CDATA wrapper if present
-    const cdataMatch = content.match(/^<!\[CDATA\[([\s\S]*?)\]\]>$/i);
-    if (cdataMatch) {
-      content = cdataMatch[1].trim();
-    }
-    result[normTag] = content;
-    if (result[rawTag] === undefined) {
-      result[rawTag] = content;
-    }
-    lastClosedEnd = tagRegex.lastIndex;
+    const normTag = match[1].toLowerCase().replace(/-/g, '_');
+    if (result[normTag] === undefined) result[normTag] = match[2].trim();
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Translation units
+// ---------------------------------------------------------------------------
+
+function keysToText(keys) {
+  if (Array.isArray(keys)) return keys.map(k => String(k).trim()).filter(Boolean).join('\n');
+  if (typeof keys === 'string') return keys.split(/[\n,;]+/).map(k => k.trim()).filter(Boolean).join('\n');
+  return '';
+}
+
+function splitList(text) {
+  return String(text || '').split(/[\n,;]+/).map(k => k.trim()).filter(Boolean);
+}
+
+/**
+ * Turns card data into a flat list of translatable units with stable ids.
+ */
+export function buildTranslationUnits(data, { translateTags = true } = {}) {
+  const units = [];
+  const push = (id, type, label, text) => {
+    if (text && String(text).trim()) units.push({ id, type, label, text: String(text) });
+  };
+
+  for (const f of TEXT_FIELDS) {
+    push(`field:${f.key}`, f.key === 'name' ? 'name' : 'text', f.label, data[f.key]);
+  }
+  (data.alternate_greetings || []).forEach((g, i) => push(`greeting:${i}`, 'text', `Альтернативное приветствие #${i + 1}`, g));
+  (data.group_only_greetings || []).forEach((g, i) => push(`group_greeting:${i}`, 'text', `Групповое приветствие #${i + 1}`, g));
+  if (translateTags && Array.isArray(data.tags) && data.tags.length) {
+    push('tags', 'list', 'Теги', data.tags.join('\n'));
   }
 
-  // Fallback for truncated tail tag (unclosed tag at end of response)
-  const remainingText = responseText.slice(lastClosedEnd).trim();
-  if (remainingText) {
-    const unclosedRegex = /<([a-zA-Z0-9_-]+)(?:\s+[^>]*)?>([\s\S]+)$/i;
-    const unclosedMatch = remainingText.match(unclosedRegex);
-    if (unclosedMatch) {
-      const rawTag = unclosedMatch[1];
-      const normTag = rawTag.toLowerCase().replace('-', '_');
-      if (result[normTag] === undefined && !responseText.includes(`</${rawTag}>`)) {
-        let content = unclosedMatch[2].trim();
-        const cdataMatch = content.match(/^<!\[CDATA\[([\s\S]*?)\]\]>$/i);
-        if (cdataMatch) content = cdataMatch[1].trim();
-        result[normTag] = content;
-        result[rawTag] = content;
+  const book = data.character_book;
+  if (book) {
+    push('lore_name', 'text', 'Название лорбука', book.name);
+    push('lore_desc', 'text', 'Описание лорбука', book.description);
+    (book.entries || []).forEach((e, i) => {
+      if (!e) return;
+      push(`entry:${i}:comment`, 'text', `Лорбук #${i + 1}: название`, e.comment);
+      push(`entry:${i}:keys`, 'keys', `Лорбук #${i + 1}: ключи`, keysToText(e.keys));
+      push(`entry:${i}:secondary_keys`, 'keys', `Лорбук #${i + 1}: доп. ключи`, keysToText(e.secondary_keys));
+      push(`entry:${i}:content`, 'text', `Лорбук #${i + 1}: содержание`, e.content);
+    });
+  }
+  return units;
+}
+
+/**
+ * Returns the source text a unit id points to (used for QA checks in the UI).
+ */
+export function getUnitSource(data, id) {
+  return buildTranslationUnits(data, { translateTags: true }).find(u => u.id === id)?.text || '';
+}
+
+function estimateTokens(text) {
+  return countStats(text).estimatedTokens;
+}
+
+/**
+ * Packs units into batches so that the expected output fits into maxTokens.
+ * Russian output is ~1.5–2x the English token count, so input per batch is capped at ~35% of maxTokens.
+ */
+export function packBatches(units, maxTokens = 8192) {
+  const budget = Math.max(400, Math.min(6000, Math.floor(maxTokens * 0.35)));
+  const MAX_UNITS = 16;
+  const batches = [];
+  let current = [];
+  let used = 0;
+  for (const unit of units) {
+    const cost = estimateTokens(unit.text) + 12;
+    if (current.length && (used + cost > budget || current.length >= MAX_UNITS)) {
+      batches.push(current);
+      current = [];
+      used = 0;
+    }
+    current.push(unit);
+    used += cost;
+  }
+  if (current.length) batches.push(current);
+  return batches;
+}
+
+function formatGlossary(map) {
+  const entries = Object.entries(map || {}).filter(([k, v]) => k && v);
+  return entries.length ? entries.map(([en, ru]) => `  - ${en} → ${ru}`).join('\n') : '  (нет)';
+}
+
+export function buildTranslatorSystemPrompt(passport, settings = {}) {
+  const p = passport || {};
+  const extra = (settings.extraInstructions || '').trim();
+  return `Ты — профессиональный литературный переводчик карточек персонажей для ролевых чатов (SillyTavern, Chub, JanitorAI).
+Переведи на русский язык содержимое каждого блока <field id="...">.
+
+=== ПАСПОРТ ПЕРСОНАЖА (соблюдай строго) ===
+- Имя на русском: ${p.character_name_ru || 'транслитерируй исходное имя'}
+- Пол: ${p.gender || 'определи по тексту'}
+- Род глаголов персонажа: ${p.verb_gender || 'определи по тексту'}
+- Обращение персонажа к {{user}}: «${p.user_pronoun || 'ты'}»
+- Тон и манера речи: ${p.speech_tone || 'как в оригинале'}
+- Глоссарий (используй именно эти переводы):
+${formatGlossary(p.glossary)}
+
+=== ПРАВИЛА ===
+1. Макросы копируй без изменений: {{char}}, {{user}}, {{original}}, {{persona}} и любые другие {{...}}, а также <START>. Не заменяй {{char}} и {{user}} именами. {{sub}} и {{obj}} замени на {{user}}.
+2. HTML/XML-теги, их имена и атрибуты не переводи — переводи только текст внутри. Сохраняй синтаксис W++, JSON-подобных списков, [квадратных скобок], markdown.
+3. Действия в *звёздочках* остаются в звёздочках, прямая речь — в кавычках. Сохраняй абзацы, пустые строки и переносы.
+4. Пиши живым литературным русским языком без калек, передавай характер и стиль речи.
+5. Блоки type="keys" — ключевые слова лорбука: по одному ключу на строку, короткие формы, которые реально встретятся в чате (можно несколько словоформ). Без пояснений.
+6. Блок type="list" — теги: по одному на строку, коротко.
+7. Блок type="name" — только имя, без пояснений.
+${extra ? `\n=== ДОПОЛНИТЕЛЬНЫЕ ПОЖЕЛАНИЯ ПОЛЬЗОВАТЕЛЯ ===\n${extra}\n` : ''}
+=== ФОРМАТ ОТВЕТА ===
+Верни ровно те же блоки с теми же id: <field id="...">перевод</field>, по одному на каждый входной блок, в том же порядке.
+Никакого текста вне блоков, никакого markdown-оформления ответа.`;
+}
+
+function buildBatchUserMessage(batch) {
+  return batch
+    .map(u => `<field id="${u.id}" type="${u.type}">\n${u.text}\n</field>`)
+    .join('\n\n');
+}
+
+/**
+ * Translates units in token-sized batches. Missing/truncated units are retried individually once.
+ * Never throws for partial failures — they are returned in `failed`.
+ * onProgress({ done, total, message, streamedChars, batchIndex, batchCount }) is called as work proceeds.
+ */
+export async function translateUnits({ units, passport = null, settings, signal = null, onProgress = null, onUnitDone = null }) {
+  const results = {};
+  const failed = {};
+  const total = units.length;
+  if (!total) return { results, failed: [] };
+
+  const systemPrompt = buildTranslatorSystemPrompt(passport, settings);
+  const maxTokens = numberOr(settings.maxTokens, 8192);
+  const queue = packBatches(units, maxTokens);
+  const retried = new Set();
+  let batchIndex = 0;
+  let consecutiveErrors = 0;
+
+  const report = (message, streamedChars = 0) => onProgress?.({
+    done: Object.keys(results).length,
+    total,
+    message,
+    streamedChars,
+    batchIndex,
+    batchCount: queue.length
+  });
+
+  while (queue.length > batchIndex) {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    const batch = queue[batchIndex];
+    batchIndex++;
+    const label = batch.length === 1 ? batch[0].label : `${batch.length} полей`;
+    report(`Запрос ${batchIndex}/${queue.length}: ${label}`);
+
+    let response;
+    try {
+      response = await chatCompletion({
+        settings,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: buildBatchUserMessage(batch) }
+        ],
+        maxTokens,
+        signal,
+        onDelta: (text) => report(`Запрос ${batchIndex}/${queue.length}: ${label}`, text.length)
+      });
+      consecutiveErrors = 0;
+    } catch (err) {
+      if (err.name === 'AbortError' || signal?.aborted) throw err;
+      const nothingDoneYet = Object.keys(results).length === 0;
+      // Configuration problems (bad key, wrong model, wrong URL) will fail every request — stop right away
+      if (nothingDoneYet && [400, 401, 402, 403, 404].includes(err.status)) throw err;
+      consecutiveErrors++;
+      for (const u of batch) failed[u.id] = err.message;
+      if (consecutiveErrors >= 3) {
+        for (const rest of queue.slice(batchIndex).flat()) failed[rest.id] = 'Пропущено после трёх ошибок подряд';
+        break;
+      }
+      continue;
+    }
+
+    const { fields, unclosed } = extractTaggedFields(response.content);
+    const missing = [];
+    for (const u of batch) {
+      const value = fields[u.id];
+      const isPartial = unclosed.includes(u.id) && response.truncated;
+      if (value === undefined || !value.trim() || isPartial) {
+        missing.push(u);
+        continue;
+      }
+      results[u.id] = postProcess(u, value);
+      delete failed[u.id];
+      onUnitDone?.(u.id, results[u.id]);
+    }
+
+    // A single-field batch with an answer but no tags: accept the whole answer
+    if (batch.length === 1 && missing.length === 1 && !Object.keys(fields).length && response.content.trim() && !response.truncated) {
+      const u = batch[0];
+      results[u.id] = postProcess(u, response.content);
+      onUnitDone?.(u.id, results[u.id]);
+      missing.length = 0;
+    }
+
+    for (const u of missing) {
+      if (!retried.has(u.id) && batch.length > 1) {
+        retried.add(u.id);
+        queue.push([u]);
+      } else {
+        failed[u.id] = response.truncated
+          ? `Ответ обрезан лимитом Max Tokens (${maxTokens}). Увеличьте лимит в настройках.`
+          : 'Модель не вернула перевод этого поля';
       }
     }
   }
 
-  return result;
+  report('Готово');
+  return {
+    results,
+    failed: Object.entries(failed).map(([id, reason]) => ({ id, reason, label: units.find(u => u.id === id)?.label || id }))
+  };
+}
+
+function postProcess(unit, value) {
+  if (unit.type === 'keys' || unit.type === 'list') return splitList(value).join('\n');
+  if (unit.type === 'name') return value.split('\n')[0].trim();
+  return repairMacrosAndTags(value);
 }
 
 /**
- * Common helper to execute chat completions with automatic CORS proxy fallback
+ * Writes translated unit values into a copy of `targetData` (or into targetData itself with inPlace).
+ * `sourceData` is the original card data (needed for additive lorebook keys).
  */
-async function postChatCompletion({
-  rawEndpoint,
-  requestBody,
-  headers,
-  provider,
-  signal
-}) {
-  const initialUrl = resolveUrl(rawEndpoint, provider);
-  const isProxy = initialUrl.startsWith('/api-proxy');
+export function applyTranslations(targetData, results, sourceData, passport = null, { inPlace = false } = {}) {
+  const data = inPlace ? targetData : JSON.parse(JSON.stringify(targetData));
+  const lorebookKeyMap = passport?.lorebook_keys || {};
 
-  let response;
-  try {
-    response = await fetch(initialUrl, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(requestBody),
-      signal
-    });
-  } catch (err) {
-    if (signal?.aborted) throw err;
-    const isNetworkOrCors = err.name === 'TypeError' ||
-      err.message.includes('Failed to fetch') ||
-      err.message.includes('NetworkError') ||
-      err.message.includes('network error');
-
-    const isLocalServer = window.location.protocol.startsWith('http') &&
-      (window.location.hostname === '127.0.0.1' ||
-       window.location.hostname === 'localhost' ||
-       window.location.hostname === '::1' ||
-       window.location.hostname === '[::1]');
-
-    if (!isProxy && isNetworkOrCors && isLocalServer) {
-      console.warn(`Direct request to ${rawEndpoint} failed due to CORS/network (${err.message}). Retrying via /api-proxy...`);
-      const proxyUrl = `/api-proxy?target=${encodeURIComponent(rawEndpoint)}`;
-      response = await fetch(proxyUrl, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(requestBody),
-        signal
-      });
-    } else {
-      throw err;
+  for (const [id, value] of Object.entries(results)) {
+    const parts = id.split(':');
+    if (parts[0] === 'field') {
+      data[parts[1]] = value;
+    } else if (parts[0] === 'greeting' || parts[0] === 'group_greeting') {
+      const listKey = parts[0] === 'greeting' ? 'alternate_greetings' : 'group_only_greetings';
+      const idx = Number(parts[1]);
+      if (!Array.isArray(data[listKey])) data[listKey] = [...(sourceData[listKey] || [])];
+      data[listKey][idx] = value;
+    } else if (id === 'tags') {
+      data.tags = splitList(value);
+    } else if (id === 'lore_name' || id === 'lore_desc') {
+      if (!data.character_book) data.character_book = JSON.parse(JSON.stringify(sourceData.character_book || { entries: [] }));
+      data.character_book[id === 'lore_name' ? 'name' : 'description'] = value;
+    } else if (parts[0] === 'entry') {
+      const idx = Number(parts[1]);
+      const prop = parts[2];
+      if (!data.character_book) data.character_book = JSON.parse(JSON.stringify(sourceData.character_book || { entries: [] }));
+      const entry = data.character_book.entries?.[idx];
+      if (!entry) continue;
+      if (prop === 'keys' || prop === 'secondary_keys') {
+        // Additive: keep original keys so the lorebook still triggers on English text
+        const srcEntry = sourceData.character_book?.entries?.[idx] || {};
+        const original = splitList(keysToText(srcEntry[prop]));
+        const fromPassport = prop === 'keys'
+          ? original.flatMap(k => splitList(lorebookKeyMap[k] || lorebookKeyMap[k.toLowerCase()] || ''))
+          : [];
+        entry[prop] = [...new Set([...original, ...splitList(value), ...fromPassport])];
+      } else {
+        entry[prop] = value;
+      }
     }
   }
+  return data;
+}
 
-  const resText = await response.text();
-  let resJson;
-  try {
-    resJson = JSON.parse(resText);
-  } catch (e) {
-    throw new Error(`Ошибка разбора ответа (${response.status}): ${resText.slice(0, 150) || e.message}`);
+// ---------------------------------------------------------------------------
+// Step 1: passport
+// ---------------------------------------------------------------------------
+
+export const DEFAULT_PASSPORT = {
+  character_name_ru: '',
+  gender: '',
+  verb_gender: '',
+  user_pronoun: 'ты',
+  speech_tone: '',
+  glossary: {},
+  lorebook_keys: {}
+};
+
+function sanitizeStringMap(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const out = {};
+  for (const [k, v] of Object.entries(value)) {
+    if (k && v !== null && v !== undefined && String(v).trim()) out[String(k).trim()] = String(v).trim();
   }
-
-  if (!response.ok) {
-    const errorDetail = resJson.error?.message || JSON.stringify(resJson);
-    throw new Error(`Ошибка API (${response.status}): ${errorDetail}`);
-  }
-
-  const choice = resJson.choices?.[0];
-  const msg = choice?.message;
-  let content = msg?.content || msg?.reasoning_content || choice?.text || '';
-  return cleanModelPreamble(content);
+  return out;
 }
 
 /**
  * Step 1: Context & Glossary Pass
  * Analyzes the card to create a context passport (gender, pronoun, verb gender, speech tone, glossary, lorebook keys).
  */
-export async function analyzeCardContext({
-  cardData,
-  settings,
-  signal = null
-}) {
-  if ((settings.provider === 'nanogpt' || settings.provider === 'openrouter') && (!settings.apiKey || !settings.apiKey.trim())) {
-    throw new Error('API-ключ не задан! Откройте «⚙️ Настройки API» и вставьте ваш ключ от ' + (settings.provider === 'nanogpt' ? 'Nano-GPT' : 'OpenRouter') + '.');
-  }
-
-  const cleanBaseUrl = settings.baseUrl.replace(/\/+$/, '');
-  const rawEndpoint = `${cleanBaseUrl}/chat/completions`;
-
-  const headers = {
-    'Content-Type': 'application/json',
-    'Accept': 'application/json'
-  };
-
-  if (settings.apiKey) {
-    const trimmedKey = settings.apiKey.trim();
-    headers['Authorization'] = `Bearer ${trimmedKey}`;
-    headers['x-api-key'] = trimmedKey;
-  }
-
-  if (settings.provider === 'openrouter') {
-    headers['HTTP-Referer'] = window.location.origin || 'http://localhost';
-    headers['X-Title'] = 'AI Character Card Translator';
-  }
-
-  // Sample relevant context fields
+export async function analyzeCardContext({ cardData, settings, signal = null, onDelta = null }) {
   const sampleParts = [];
   if (cardData.name) sampleParts.push(`Character Name: ${cardData.name}`);
-  if (cardData.description) sampleParts.push(`Description:\n${cardData.description.slice(0, 1500)}`);
-  if (cardData.personality) sampleParts.push(`Personality:\n${cardData.personality.slice(0, 800)}`);
-  if (cardData.scenario) sampleParts.push(`Scenario:\n${cardData.scenario.slice(0, 800)}`);
-  if (cardData.first_mes) sampleParts.push(`First Message:\n${cardData.first_mes.slice(0, 1200)}`);
+  if (cardData.description) sampleParts.push(`Description:\n${cardData.description.slice(0, 3000)}`);
+  if (cardData.personality) sampleParts.push(`Personality:\n${cardData.personality.slice(0, 1000)}`);
+  if (cardData.scenario) sampleParts.push(`Scenario:\n${cardData.scenario.slice(0, 1000)}`);
+  if (cardData.first_mes) sampleParts.push(`First Message:\n${cardData.first_mes.slice(0, 2000)}`);
+  if (cardData.mes_example) sampleParts.push(`Dialogue examples:\n${cardData.mes_example.slice(0, 1000)}`);
 
-  let lorebookPrompt = '';
-  if (cardData.character_book) {
-    if (cardData.character_book.name) sampleParts.push(`Lorebook Name: ${cardData.character_book.name}`);
-    if (Array.isArray(cardData.character_book.entries)) {
-      const allKeys = [];
-      cardData.character_book.entries.forEach(e => {
-        if (Array.isArray(e.keys)) allKeys.push(...e.keys);
-        else if (typeof e.keys === 'string') allKeys.push(...e.keys.split(/[\n,;]+/));
-      });
-      const uniqueKeys = [...new Set(allKeys.map(k => String(k).trim()).filter(Boolean))].slice(0, 30);
-      if (uniqueKeys.length > 0) {
-        lorebookPrompt = `\nLorebook Trigger Keys: ${JSON.stringify(uniqueKeys)}`;
-      }
-    }
+  const book = cardData.character_book;
+  if (book) {
+    if (book.name) sampleParts.push(`Lorebook Name: ${book.name}`);
+    const allKeys = (book.entries || []).flatMap(e => splitList(keysToText(e?.keys)));
+    const uniqueKeys = [...new Set(allKeys)].slice(0, 60);
+    if (uniqueKeys.length) sampleParts.push(`Lorebook Trigger Keys: ${JSON.stringify(uniqueKeys)}`);
   }
 
-  const systemPrompt = `Ты — эксперт-аналитик карточек персонажей для ролевых игр (SillyTavern, Chub, TavernAI).
-Твоя задача — проанализировать предоставленный текст карточки персонажа на английском языке и сформировать компактный паспорт контекста для переводчика.
+  const systemPrompt = `Ты — аналитик карточек персонажей для ролевых чатов. Проанализируй карточку и составь паспорт для переводчика на русский язык.
 
-Верни ответ ИСКЛЮЧИТЕЛЬНО в формате валидного JSON со следующими ключами:
+Верни ТОЛЬКО валидный JSON:
 {
   "character_name_ru": "Русское имя или транслитерация (например: Серафина Вейл)",
-  "gender": "Пол персонажа (женский / мужской / иной)",
-  "verb_gender": "он сделал" | "она сделала" | "оно сделало",
-  "user_pronoun": "ты" | "вы" (выбери подходящее обращение персонажа к {{user}} исходя из дистанции, статуса и характера)",
-  "speech_tone": "Краткое описание тона и манеры речи (например: саркастичный, холодный, вежливый, архаичный)",
-  "glossary": {
-    "English Term": "Русский перевод"
-  },
-  "lorebook_keys": {
-    "english key": "русский ключ"
-  }
+  "gender": "женский | мужской | иной",
+  "verb_gender": "она сделала | он сделал | оно сделало | они сделали",
+  "user_pronoun": "ты | вы — как персонаж обращается к {{user}} (по дистанции, статусу и характеру)",
+  "speech_tone": "Краткое описание манеры речи (например: саркастичная, холодная, архаичная)",
+  "glossary": { "English term": "Русский перевод" },
+  "lorebook_keys": { "english key": "русский ключ" }
 }
 
-ПРАВИЛА:
-1. В "glossary" включи ключевые имена собственные, локации, титулы, фракции, артефакты и уникальные понятия из карточки.
-2. В "lorebook_keys" переведи триггерные ключи лорбука, если они предоставлены. Если лорбука нет, верни {}.
-3. Ответ должен содержать ТОЛЬКО валидный JSON-объект без лишних слов, без предисловий и без markdown-тегов вне JSON.`;
-
-  const userContent = `Проанализируй карточку персонажа и верни JSON-паспорт контекста:\n\n${sampleParts.join('\n\n')}${lorebookPrompt}`;
-
-  const requestBody = {
-    model: settings.model || 'deepseek/deepseek-chat',
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userContent }
-    ],
-    temperature: 0.1,
-    max_tokens: 1500,
-    stream: false
-  };
+Правила:
+1. В glossary — имена собственные, локации, титулы, фракции, артефакты, уникальные понятия.
+2. В lorebook_keys — переводы триггерных ключей лорбука, если они даны; иначе {}.
+3. Никакого текста вне JSON.`;
 
   try {
-    const rawContent = await postChatCompletion({
-      rawEndpoint,
-      requestBody,
-      headers,
-      provider: settings.provider,
-      signal
+    const { content } = await chatCompletion({
+      settings,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: sampleParts.join('\n\n') }
+      ],
+      temperature: 0.1,
+      maxTokens: Math.max(2000, Math.min(numberOr(settings.maxTokens, 8192), 4000)),
+      signal,
+      onDelta
     });
 
-    let jsonStr = rawContent;
-    const matchJson = jsonStr.match(/\{[\s\S]*\}/);
-    if (matchJson) {
-      jsonStr = matchJson[0];
-    }
-
-    let parsed = {};
-    try {
-      parsed = JSON.parse(jsonStr);
-    } catch (e) {
-      console.warn('Failed to parse passport JSON, using defaults', e);
-    }
-
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : content);
     return {
-      character_name_ru: parsed.character_name_ru || cardData.name || '',
-      gender: parsed.gender || 'не определен',
-      verb_gender: parsed.verb_gender || 'он сделал',
-      user_pronoun: parsed.user_pronoun === 'вы' ? 'вы' : 'ты',
-      speech_tone: parsed.speech_tone || 'литературный',
-      glossary: (parsed.glossary && typeof parsed.glossary === 'object') ? parsed.glossary : {},
-      lorebook_keys: (parsed.lorebook_keys && typeof parsed.lorebook_keys === 'object') ? parsed.lorebook_keys : {}
+      character_name_ru: String(parsed.character_name_ru || cardData.name || ''),
+      gender: String(parsed.gender || ''),
+      verb_gender: String(parsed.verb_gender || ''),
+      user_pronoun: String(parsed.user_pronoun).trim().toLowerCase() === 'вы' ? 'вы' : 'ты',
+      speech_tone: String(parsed.speech_tone || ''),
+      glossary: sanitizeStringMap(parsed.glossary),
+      lorebook_keys: sanitizeStringMap(parsed.lorebook_keys)
     };
   } catch (err) {
-    if (err.name === 'AbortError') throw err;
+    if (err.name === 'AbortError' || signal?.aborted) throw err;
+    // Configuration problems surface immediately instead of being hidden behind a fallback passport
+    if (err instanceof LlmError && err.status) throw err;
     console.warn('Step 1 passport analysis failed, proceeding with fallback passport:', err);
-    return {
-      character_name_ru: cardData.name || '',
-      gender: 'не определен',
-      verb_gender: 'он сделал',
-      user_pronoun: 'ты',
-      speech_tone: 'литературный',
-      glossary: {},
-      lorebook_keys: {}
-    };
+    return { ...DEFAULT_PASSPORT, character_name_ru: cardData.name || '', failed: true };
   }
 }
 
-/**
- * Step 2: Execution Translation Pass
- * Translates all card fields and lorebook using XML tag format.
- * Injects Step 1 passport into the system prompt.
- * Step 2.5: Client-side JS Guardian parses XML tags, repairs macros/asterisks, and performs additive lorebook key expansion.
- */
-export async function translateFullCard({
-  cardData,
-  passport = null,
-  settings,
-  signal = null,
-  onProgress = null
-}) {
-  if ((settings.provider === 'nanogpt' || settings.provider === 'openrouter') && (!settings.apiKey || !settings.apiKey.trim())) {
-    throw new Error('API-ключ не задан! Откройте «⚙️ Настройки API» и вставьте ваш ключ от ' + (settings.provider === 'nanogpt' ? 'Nano-GPT' : 'OpenRouter') + '.');
-  }
-
-  const cleanBaseUrl = settings.baseUrl.replace(/\/+$/, '');
-  const rawEndpoint = `${cleanBaseUrl}/chat/completions`;
-
-  const headers = {
-    'Content-Type': 'application/json',
-    'Accept': 'application/json'
-  };
-
-  if (settings.apiKey) {
-    const trimmedKey = settings.apiKey.trim();
-    headers['Authorization'] = `Bearer ${trimmedKey}`;
-    headers['x-api-key'] = trimmedKey;
-  }
-
-  if (settings.provider === 'openrouter') {
-    headers['HTTP-Referer'] = window.location.origin || 'http://localhost';
-    headers['X-Title'] = 'AI Character Card Translator';
-  }
-
-  // Format glossary for system prompt
-  let glossaryText = '';
-  if (passport?.glossary && Object.keys(passport.glossary).length > 0) {
-    glossaryText = Object.entries(passport.glossary)
-      .map(([en, ru]) => `  - "${en}" -> "${ru}"`)
-      .join('\n');
-  } else {
-    glossaryText = '  (нет специфических терминов)';
-  }
-
-  const fullCardSystemPrompt = `Ты — профессиональный литературный переводчик и эксперт по карточкам персонажей для SillyTavern / Chub / TavernAI.
-Твоя задача — качественно и художественно перевести все поля карточки на русский язык в точном соответствии с утвержденным паспортом контекста персонажа.
-
-=== ПАСПОРТ КОНТЕКСТА ПЕРСОНАЖА (СТРОГО ОБЯЗАТЕЛЕН) ===
-- Русское имя: ${passport?.character_name_ru || cardData.name || 'не указано'}
-- Пол персонажа: ${passport?.gender || 'не указан'}
-- Род глаголов персонажа: ${passport?.verb_gender || 'он сделал'}
-- Обращение персонажа к {{user}}: строго "${passport?.user_pronoun || 'ты'}"
-- Тон и манера речи: ${passport?.speech_tone || 'литературный'}
-- Обязательный глоссарий терминов и имен:
-${glossaryText}
-
-=== КРИТИЧЕСКИЕ ПРАВИЛА: ===
-1. СОБЛЮДАЙ ПАСПОРТ КОНТЕКСТА:
-   - Все глаголы персонажа в прошедшем времени согласуй строго по паспорту: "${passport?.verb_gender || 'он сделал'}".
-   - Все реплики персонажа к {{user}} должны использовать форму обращения "${passport?.user_pronoun || 'ты'}".
-   - Строго используй переводы терминов и имен из глоссария!
-2. МАКРОСЫ И РАЗДЕЛИТЕЛИ:
-   - СТРОГО сохраняй без изменений: {{char}}, {{user}}, {{original}}, <START>.
-   - НЕ заменяй {{char}} на имя персонажа! Оставляй именно {{char}} и {{user}}!
-   - Макросы {{sub}} и {{obj}} (из JanitorAI) заменяй на {{user}}!
-3. ФОРМАТИРОВАНИЕ ДЕЙСТВИЙ И РЕПЛИК:
-   - Действия персонажа в звездочках *действие* должны оставаться в парных звездочках *действие*.
-   - Прямая речь персонажей — в кавычках («...» или "...").
-   - Сохраняй разделители реплик <START> на отдельных строках.
-4. ФОРМАТ ВЫВОДА (XML ТЕГИ):
-   - Оберни перевод каждого поля в соответствующий XML-тег в точности как в запросе (например: <name>...</name>, <first_mes>...</first_mes>, <greeting_0>...</greeting_0>, <entry_0_content>...</entry_0_content>).
-   - НЕ используй JSON! Выводи данные только внутри тегов.
-   - НЕ добавляй никакого текста до первого тега или после последнего тега. Выводи ТОЛЬКО запрошенные XML-теги.`;
-
-  const standardKeys = [
-    'name', 'first_mes', 'description', 'personality', 'scenario',
-    'mes_example', 'creator_notes', 'system_prompt', 'post_history_instructions'
-  ];
-
-  const lorebookEntries = cardData.character_book?.entries;
-  const isLorebookLarge = Array.isArray(lorebookEntries) && lorebookEntries.length > 4;
-
-  // Format main fields into XML tags
-  const xmlPayloadParts = [];
-  for (const k of standardKeys) {
-    if (cardData[k] && String(cardData[k]).trim()) {
-      xmlPayloadParts.push(`<${k}>\n${cardData[k]}\n</${k}>`);
-    }
-  }
-
-  if (Array.isArray(cardData.tags) && cardData.tags.length > 0) {
-    xmlPayloadParts.push(`<tags>\n${cardData.tags.join(', ')}\n</tags>`);
-  }
-
-  if (Array.isArray(cardData.alternate_greetings)) {
-    cardData.alternate_greetings.forEach((g, idx) => {
-      if (g && String(g).trim()) {
-        xmlPayloadParts.push(`<greeting_${idx}>\n${g}\n</greeting_${idx}>`);
-      }
-    });
-  }
-
-  // Lorebook metadata and (if small) entries
-  if (cardData.character_book) {
-    if (cardData.character_book.name) {
-      xmlPayloadParts.push(`<lorebook_name>\n${cardData.character_book.name}\n</lorebook_name>`);
-    }
-    if (cardData.character_book.description) {
-      xmlPayloadParts.push(`<lorebook_description>\n${cardData.character_book.description}\n</lorebook_description>`);
-    }
-    if (!isLorebookLarge && Array.isArray(lorebookEntries)) {
-      lorebookEntries.forEach((entry, idx) => {
-        if (!entry) return;
-        if (entry.content) {
-          xmlPayloadParts.push(`<entry_${idx}_content>\n${entry.content}\n</entry_${idx}_content>`);
-        }
-        const keysVal = Array.isArray(entry.keys) ? entry.keys.join(', ') : (entry.keys || '');
-        if (keysVal.trim()) {
-          xmlPayloadParts.push(`<entry_${idx}_keys>\n${keysVal}\n</entry_${idx}_keys>`);
-        }
-        if (entry.comment) {
-          xmlPayloadParts.push(`<entry_${idx}_comment>\n${entry.comment}\n</entry_${idx}_comment>`);
-        }
-      });
-    }
-  }
-
-  const userContent = `Переведи поля карточки на русский язык с соблюдением паспорта контекста. Верни результат в соответствующих XML-тегах:\n\n${xmlPayloadParts.join('\n\n')}`;
-
-  const requestBody = {
-    model: settings.model || 'deepseek/deepseek-chat',
-    messages: [
-      { role: 'system', content: fullCardSystemPrompt },
-      { role: 'user', content: userContent }
-    ],
-    temperature: parseFloat(settings.temperature) || 0.3,
-    max_tokens: parseInt(settings.maxTokens, 10) || 8192,
-    stream: false
-  };
-
-  try {
-    if (onProgress) {
-      onProgress({ percent: isLorebookLarge ? 55 : 80, message: 'Перевод основных полей карточки...' });
-    }
-
-    const rawContent = await postChatCompletion({
-      rawEndpoint,
-      requestBody,
-      headers,
-      provider: settings.provider,
-      signal
-    });
-
-    const xmlFields = parseXmlFields(rawContent);
-    const result = {};
-
-    // Process standard fields
-    for (const k of standardKeys) {
-      if (xmlFields[k] !== undefined) {
-        if (k === 'name') {
-          result.name = xmlFields.name.trim();
-        } else {
-          result[k] = repairMacrosAndTags(balanceAsterisks(xmlFields[k]));
-        }
-      }
-    }
-
-    if (!result.name && passport?.character_name_ru) {
-      result.name = passport.character_name_ru.trim();
-    }
-
-    if (xmlFields.tags) {
-      result.tags = xmlFields.tags.split(/[\n,;]+/).map(t => t.trim()).filter(Boolean);
-    }
-
-    if (Array.isArray(cardData.alternate_greetings) && cardData.alternate_greetings.length > 0) {
-      result.alternate_greetings = cardData.alternate_greetings.map((origG, idx) => {
-        const transG = xmlFields[`greeting_${idx}`] || xmlFields[`greeting${idx}`];
-        return transG ? repairMacrosAndTags(balanceAsterisks(transG)) : origG;
-      });
-    }
-
-    // Helper to process a single lorebook entry with additive keys
-    function applyLorebookEntry(newBook, entry, idx, fields) {
-      const transContent = fields[`entry_${idx}_content`];
-      if (transContent) {
-        entry.content = repairMacrosAndTags(balanceAsterisks(transContent));
-      }
-
-      const transComment = fields[`entry_${idx}_comment`];
-      if (transComment) {
-        entry.comment = transComment.trim();
-      }
-
-      let origKeysArr = [];
-      if (Array.isArray(entry.keys)) {
-        origKeysArr = entry.keys;
-      } else if (typeof entry.keys === 'string') {
-        origKeysArr = entry.keys.split(/[\n,;]+/);
-      }
-      const keys_original = origKeysArr.map(k => String(k).trim()).filter(Boolean);
-
-      const transKeysRaw = fields[`entry_${idx}_keys`];
-      const keys_from_xml = transKeysRaw
-        ? transKeysRaw.split(/[\n,;]+/).map(k => k.trim()).filter(Boolean)
-        : [];
-
-      const keys_from_passport = keys_original.flatMap(k => {
-        const lower = k.toLowerCase();
-        const mapped = passport?.lorebook_keys?.[k] || passport?.lorebook_keys?.[lower];
-        return mapped ? String(mapped).split(/[\n,;]+/) : [];
-      }).map(k => k.trim()).filter(Boolean);
-
-      entry.keys = [...new Set([...keys_original, ...keys_from_xml, ...keys_from_passport])];
-    }
-
-    // Process lorebook
-    if (cardData.character_book) {
-      const newBook = JSON.parse(JSON.stringify(cardData.character_book));
-      if (xmlFields.lorebook_name) newBook.name = xmlFields.lorebook_name.trim();
-      if (xmlFields.lorebook_description) newBook.description = xmlFields.lorebook_description.trim();
-
-      if (!isLorebookLarge && Array.isArray(newBook.entries)) {
-        newBook.entries.forEach((entry, idx) => {
-          applyLorebookEntry(newBook, entry, idx, xmlFields);
-        });
-      } else if (isLorebookLarge && Array.isArray(newBook.entries)) {
-        // Chunked translation for large lorebooks (4-5 entries per chunk to avoid any token limit)
-        const CHUNK_SIZE = 4;
-        const totalEntries = newBook.entries.length;
-
-        for (let chunkStart = 0; chunkStart < totalEntries; chunkStart += CHUNK_SIZE) {
-          if (signal?.aborted) throw new Error('Перевод был отменен пользователем.');
-
-          const chunkEnd = Math.min(chunkStart + CHUNK_SIZE, totalEntries);
-          const currentChunkPercent = 55 + Math.round(((chunkStart + 1) / totalEntries) * 40);
-
-          if (onProgress) {
-            onProgress({
-              percent: currentChunkPercent,
-              message: `Перевод лорбука: записи ${chunkStart + 1}–${chunkEnd} из ${totalEntries}...`
-            });
-          }
-
-          const chunkXmlParts = [];
-          for (let i = chunkStart; i < chunkEnd; i++) {
-            const e = newBook.entries[i];
-            if (!e) continue;
-            if (e.content) chunkXmlParts.push(`<entry_${i}_content>\n${e.content}\n</entry_${i}_content>`);
-            const kVal = Array.isArray(e.keys) ? e.keys.join(', ') : (e.keys || '');
-            if (kVal.trim()) chunkXmlParts.push(`<entry_${i}_keys>\n${kVal}\n</entry_${i}_keys>`);
-            if (e.comment) chunkXmlParts.push(`<entry_${i}_comment>\n${e.comment}\n</entry_${i}_comment>`);
-          }
-
-          const chunkUserContent = `Переведи следующие записи лорбука на русский язык с соблюдением паспорта контекста. Верни результат в соответствующих XML-тегах:\n\n${chunkXmlParts.join('\n\n')}`;
-
-          const chunkRequestBody = {
-            model: settings.model || 'deepseek/deepseek-chat',
-            messages: [
-              { role: 'system', content: fullCardSystemPrompt },
-              { role: 'user', content: chunkUserContent }
-            ],
-            temperature: parseFloat(settings.temperature) || 0.3,
-            max_tokens: parseInt(settings.maxTokens, 10) || 8192,
-            stream: false
-          };
-
-          const chunkRaw = await postChatCompletion({
-            rawEndpoint,
-            requestBody: chunkRequestBody,
-            headers,
-            provider: settings.provider,
-            signal
-          });
-
-          const chunkXmlFields = parseXmlFields(chunkRaw);
-          for (let i = chunkStart; i < chunkEnd; i++) {
-            const e = newBook.entries[i];
-            if (e) applyLorebookEntry(newBook, e, i, chunkXmlFields);
-          }
-        }
-      }
-
-      result.character_book = newBook;
-    }
-
-    return result;
-  } catch (err) {
-    if (err.name === 'AbortError') {
-      throw new Error('Перевод был отменен пользователем.');
-    }
-    let msg = err.message;
-    if (msg.includes('Failed to fetch') || msg.includes('NetworkError') || err.name === 'TypeError') {
-      msg = 'Сетевая ошибка при запросе к LLM. Убедитесь, что сервер запущен через start.bat или run.py.';
-    }
-    throw new Error(msg);
-  }
-}
+// ---------------------------------------------------------------------------
+// Assistant
+// ---------------------------------------------------------------------------
 
 /**
  * Asks AI a question about the character card or requests an explanation/analysis.
  */
-export async function askCharacterAI({
-  cardData,
-  question,
-  settings,
-  signal = null
-}) {
+export async function askCharacterAI({ cardData, question, settings, signal = null, onDelta = null }) {
   if (!question || !question.trim()) {
     throw new Error('Вопрос не может быть пустым.');
   }
 
-  if ((settings.provider === 'nanogpt' || settings.provider === 'openrouter') && (!settings.apiKey || !settings.apiKey.trim())) {
-    throw new Error('API-ключ не задан! Откройте «⚙️ Настройки API» и вставьте ваш ключ от ' + (settings.provider === 'nanogpt' ? 'Nano-GPT' : 'OpenRouter') + '.');
+  const parts = [];
+  for (const f of TEXT_FIELDS) {
+    if (cardData[f.key]) parts.push(`${f.label}:\n${cardData[f.key]}`);
+  }
+  if (cardData.alternate_greetings?.length) {
+    parts.push(`Альтернативные приветствия (${cardData.alternate_greetings.length}):\n${cardData.alternate_greetings.join('\n---\n')}`);
+  }
+  const entries = cardData.character_book?.entries || [];
+  if (entries.length) {
+    const sample = entries.slice(0, 15)
+      .map(e => `[${e.comment || 'Запись'}: ${keysToText(e.keys).replace(/\n/g, ', ')}] ${e.content || ''}`)
+      .join('\n');
+    parts.push(`Лорбук (${entries.length} записей):\n${sample}`);
   }
 
-  const cleanBaseUrl = settings.baseUrl.replace(/\/+$/, '');
-  const rawEndpoint = `${cleanBaseUrl}/chat/completions`;
+  const systemPrompt = `Ты — эксперт по карточкам персонажей для ролевых чатов (SillyTavern, Chub, TavernAI).
+Внимательно проанализируй карточку и дай глубокий, структурированный ответ на вопрос пользователя.
+Отвечай на русском, используй абзацы и списки. Сохраняй макросы {{char}} и {{user}} в объяснениях.`;
 
-  const headers = {
-    'Content-Type': 'application/json',
-    'Accept': 'application/json'
-  };
-
-  if (settings.apiKey) {
-    const trimmedKey = settings.apiKey.trim();
-    headers['Authorization'] = `Bearer ${trimmedKey}`;
-    headers['x-api-key'] = trimmedKey;
-  }
-
-  if (settings.provider === 'openrouter') {
-    headers['HTTP-Referer'] = window.location.origin || 'http://localhost';
-    headers['X-Title'] = 'AI Character Card Translator';
-  }
-
-  const cardSummaryParts = [];
-  if (cardData.name) cardSummaryParts.push(`Имя персонажа: ${cardData.name}`);
-  if (cardData.description) cardSummaryParts.push(`Описание:\n${cardData.description}`);
-  if (cardData.personality) cardSummaryParts.push(`Личность:\n${cardData.personality}`);
-  if (cardData.scenario) cardSummaryParts.push(`Сценарий:\n${cardData.scenario}`);
-  if (cardData.first_mes) cardSummaryParts.push(`Первое сообщение:\n${cardData.first_mes}`);
-  if (cardData.mes_example) cardSummaryParts.push(`Примеры диалогов:\n${cardData.mes_example}`);
-  if (cardData.system_prompt) cardSummaryParts.push(`Системный промпт:\n${cardData.system_prompt}`);
-  if (cardData.post_history_instructions) cardSummaryParts.push(`Post-history:\n${cardData.post_history_instructions}`);
-
-  if (Array.isArray(cardData.alternate_greetings) && cardData.alternate_greetings.length > 0) {
-    cardSummaryParts.push(`Альтернативные приветствия (${cardData.alternate_greetings.length}):\n${cardData.alternate_greetings.join('\n---\n')}`);
-  }
-
-  if (cardData.character_book && Array.isArray(cardData.character_book.entries)) {
-    const loreCount = cardData.character_book.entries.length;
-    const sampleLore = cardData.character_book.entries.slice(0, 10).map(e => `[${e.comment || 'Запись'}: ${(Array.isArray(e.keys) ? e.keys.join(', ') : e.keys) || ''}] ${e.content}`).join('\n');
-    cardSummaryParts.push(`Лорбук (${loreCount} записей):\n${sampleLore}`);
-  }
-
-  const systemPrompt = `Ты — ведущий эксперт по карточкам персонажей для текстовых ролевых систем (SillyTavern, Chub, TavernAI).
-Твоя задача — внимательно проанализировать предоставленную карточку персонажа и дать исчерпывающий, глубокий, структурированный и понятный ответ на вопрос пользователя.
-
-ПРАВИЛА ОТВЕТА:
-1. Отвечай на русском языке, живо, выразительно и структурированно (используй абзацы, подзаголовки, списки).
-2. Раскрывай психологию, скрытые мотивы персонажа, тонкости отыгрыша, динамику отношений с {{user}}, структуру сценария или скрытые директивы в зависимости от вопроса.
-3. Сохраняй макросы вроде {{char}} и {{user}} в объяснениях.`;
-
-  const userContent = `ДАННЫЕ КАРТОЧКИ ПЕРСОНАЖА:\n\n${cardSummaryParts.join('\n\n====================\n\n')}\n\nВОПРОС ПОЛЬЗОВАТЕЛЯ:\n${question.trim()}`;
-
-  const requestBody = {
-    model: settings.model || 'deepseek/deepseek-chat',
+  const { content } = await chatCompletion({
+    settings,
     messages: [
       { role: 'system', content: systemPrompt },
-      { role: 'user', content: userContent }
+      { role: 'user', content: `ДАННЫЕ КАРТОЧКИ:\n\n${parts.join('\n\n====================\n\n')}\n\nВОПРОС:\n${question.trim()}` }
     ],
     temperature: 0.4,
-    max_tokens: parseInt(settings.maxTokens, 10) || 8192,
-    stream: false
-  };
-
-  try {
-    const rawContent = await postChatCompletion({
-      rawEndpoint,
-      requestBody,
-      headers,
-      provider: settings.provider,
-      signal
-    });
-    return rawContent;
-  } catch (err) {
-    if (err.name === 'AbortError') throw new Error('Запрос был отменен пользователем.');
-    throw err;
-  }
+    signal,
+    onDelta
+  });
+  return content;
 }
 
+export const TRANSFORM_FIELDS = ['name', 'description', 'personality', 'scenario', 'first_mes', 'mes_example', 'system_prompt'];
+
 /**
- * Modifies/adapts a character card according to a creative user prompt/instruction.
- * Returns modified fields (name, description, personality, scenario, first_mes, mes_example, etc.) and a summary of changes.
+ * Modifies/adapts a character card according to a creative user instruction.
+ * Returns { modifiedFields, changesSummary }.
  */
-export async function transformCharacterAI({
-  cardData,
-  instruction,
-  settings,
-  signal = null
-}) {
+export async function transformCharacterAI({ cardData, instruction, settings, signal = null, onDelta = null }) {
   if (!instruction || !instruction.trim()) {
     throw new Error('Инструкция по изменению не может быть пустой.');
   }
 
-  if ((settings.provider === 'nanogpt' || settings.provider === 'openrouter') && (!settings.apiKey || !settings.apiKey.trim())) {
-    throw new Error('API-ключ не задан! Откройте «⚙️ Настройки API» и вставьте ваш ключ от ' + (settings.provider === 'nanogpt' ? 'Nano-GPT' : 'OpenRouter') + '.');
-  }
+  const payload = TRANSFORM_FIELDS
+    .filter(f => cardData[f] && String(cardData[f]).trim())
+    .map(f => `<field id="${f}">\n${cardData[f]}\n</field>`)
+    .join('\n\n');
 
-  const cleanBaseUrl = settings.baseUrl.replace(/\/+$/, '');
-  const rawEndpoint = `${cleanBaseUrl}/chat/completions`;
+  const systemPrompt = `Ты — писатель и геймдизайнер ролевых карточек для SillyTavern / Chub.
+Творчески переработай карточку персонажа СТРОГО по задаче пользователя.
 
-  const headers = {
-    'Content-Type': 'application/json',
-    'Accept': 'application/json'
-  };
+ПРАВИЛА:
+1. Сохраняй макросы {{char}}, {{user}}, {{original}}, <START> — не заменяй их именами.
+2. Действия в *звёздочках*, прямая речь в кавычках, <START> на отдельных строках.
+3. Живой литературный язык, атмосферность, психологическая глубина.
 
-  if (settings.apiKey) {
-    const trimmedKey = settings.apiKey.trim();
-    headers['Authorization'] = `Bearer ${trimmedKey}`;
-    headers['x-api-key'] = trimmedKey;
-  }
+ФОРМАТ ОТВЕТА:
+- Верни только изменённые поля в виде <field id="...">новый текст</field> с теми же id, что во входных данных.
+- Обязательно добавь <field id="changes_summary">2–4 пункта: что изменено</field>.
+- Никакого текста вне блоков.`;
 
-  if (settings.provider === 'openrouter') {
-    headers['HTTP-Referer'] = window.location.origin || 'http://localhost';
-    headers['X-Title'] = 'AI Character Card Translator';
-  }
-
-  const fields = ['name', 'description', 'personality', 'scenario', 'first_mes', 'mes_example', 'system_prompt'];
-  const xmlPayload = [];
-  for (const f of fields) {
-    if (cardData[f] && String(cardData[f]).trim()) {
-      xmlPayload.push(`<${f}>\n${cardData[f]}\n</${f}>`);
-    }
-  }
-
-  const systemPrompt = `Ты — профессиональный писатель и геймдизайнер ролевых карточек для SillyTavern / Chub / TavernAI.
-Твоя задача — творчески переработать и адаптировать карточку персонажа СТРОГО в соответствии с инструкцией/задачей пользователя.
-
-КРИТИЧЕСКИ ВАЖНЫЕ ПРАВИЛА:
-1. СТРОГО СОХРАНЯЙ ПЕРЕМЕННЫЕ И МАКРОСЫ:
-   - {{char}}, {{user}}, {{original}}, <START> НЕЛЬЗЯ удалять или заменять на статичные имена! Оставляй именно {{char}} и {{user}}!
-   - Макросы {{sub}} и {{obj}} (из JanitorAI) заменяй на {{user}}!
-2. СТИЛЬ И ФОРМАТИРОВАНИЕ РОЛЕВОЙ ИГРЫ:
-   - Действия персонажа в звездочках *действие*.
-   - Прямая речь персонажей в кавычках («...» или "...").
-   - Разделители диалогов <START> на отдельных строках.
-   - Сохраняй естественный живой литературный язык, атмосферность и психологическую глубину.
-3. ФОРМАТ ОТВЕТА (СТРОГО XML-ТЕГИ):
-   - Оберни обновленные поля в соответствующие XML-теги: <name>, <description>, <personality>, <scenario>, <first_mes>, <mes_example>, <system_prompt>.
-   - Обязательно добавь тег <changes_summary>...</changes_summary>, в котором на русском языке в 2-4 пунктах кратко опиши, что конкретно было изменено по задаче пользователя.
-   - Не добавляй никакого текста вне XML-тегов. Выводи только запрошенные теги.`;
-
-  const userContent = `ТЕКУЩИЕ ПОЛЯ КАРТОЧКИ:\n\n${xmlPayload.join('\n\n')}\n\nТВОРЧЕСКАЯ ЗАДАЧА / ИНСТРУКЦИЯ ПО ИЗМЕНЕНИЮ:\n${instruction.trim()}`;
-
-  const requestBody = {
-    model: settings.model || 'deepseek/deepseek-chat',
+  const { content } = await chatCompletion({
+    settings,
     messages: [
       { role: 'system', content: systemPrompt },
-      { role: 'user', content: userContent }
+      { role: 'user', content: `ТЕКУЩИЕ ПОЛЯ КАРТОЧКИ:\n\n${payload}\n\nЗАДАЧА:\n${instruction.trim()}` }
     ],
-    temperature: 0.5,
-    max_tokens: parseInt(settings.maxTokens, 10) || 8192,
-    stream: false
+    temperature: 0.6,
+    signal,
+    onDelta
+  });
+
+  const { fields } = extractTaggedFields(content);
+  const modifiedFields = {};
+  for (const f of TRANSFORM_FIELDS) {
+    if (fields[f] && fields[f].trim()) {
+      modifiedFields[f] = f === 'name' ? fields[f].split('\n')[0].trim() : repairMacrosAndTags(fields[f]);
+    }
+  }
+  if (!Object.keys(modifiedFields).length) {
+    throw new LlmError('Модель не вернула ни одного изменённого поля. Попробуйте переформулировать задачу или выбрать другую модель.');
+  }
+
+  return {
+    modifiedFields,
+    changesSummary: repairMacrosAndTags(fields.changes_summary || 'Изменения внесены в соответствии с задачей.')
   };
-
-  try {
-    const rawContent = await postChatCompletion({
-      rawEndpoint,
-      requestBody,
-      headers,
-      provider: settings.provider,
-      signal
-    });
-
-    const xmlFields = parseXmlFields(rawContent);
-    const modifiedFields = {};
-
-    for (const f of fields) {
-      if (xmlFields[f] !== undefined) {
-        if (f === 'name') {
-          modifiedFields.name = xmlFields.name.trim();
-        } else {
-          modifiedFields[f] = repairMacrosAndTags(balanceAsterisks(xmlFields[f]));
-        }
-      }
-    }
-
-    const changesSummary = xmlFields.changes_summary || 'Изменения успешно внесены в соответствии с инструкцией.';
-
-    return {
-      modifiedFields,
-      changesSummary: repairMacrosAndTags(changesSummary)
-    };
-  } catch (err) {
-    if (err.name === 'AbortError') throw new Error('Трансформация была отменена пользователем.');
-    throw err;
-  }
-}
-
-/**
- * Translates a single field using the selected LLM, with character context and auto-repair.
- */
-export async function translateText({
-  text,
-  fieldLabel = '',
-  charName = '',
-  context = null,
-  passport = null,
-  settings,
-  signal = null
-}) {
-  if (!text || !text.trim()) {
-    return '';
-  }
-
-  if ((settings.provider === 'nanogpt' || settings.provider === 'openrouter') && (!settings.apiKey || !settings.apiKey.trim())) {
-    throw new Error('API-ключ не задан! Откройте «⚙️ Настройки API» и вставьте ваш ключ от ' + (settings.provider === 'nanogpt' ? 'Nano-GPT' : 'OpenRouter') + '.');
-  }
-
-  const cleanBaseUrl = settings.baseUrl.replace(/\/+$/, '');
-  const rawEndpoint = `${cleanBaseUrl}/chat/completions`;
-
-  const headers = {
-    'Content-Type': 'application/json',
-    'Accept': 'application/json'
-  };
-
-  if (settings.apiKey) {
-    const trimmedKey = settings.apiKey.trim();
-    headers['Authorization'] = `Bearer ${trimmedKey}`;
-    headers['x-api-key'] = trimmedKey;
-  }
-
-  if (settings.provider === 'openrouter') {
-    headers['HTTP-Referer'] = window.location.origin || 'http://localhost';
-    headers['X-Title'] = 'AI Character Card Translator';
-  }
-
-  const userPromptParts = [];
-  if (charName) {
-    userPromptParts.push(`Имя персонажа: ${charName}`);
-  }
-  if (passport?.verb_gender) {
-    userPromptParts.push(`Род глаголов персонажа: ${passport.verb_gender}`);
-  }
-  if (passport?.user_pronoun) {
-    userPromptParts.push(`Обращение к {{user}}: ${passport.user_pronoun}`);
-  }
-  if (context?.personality) {
-    userPromptParts.push(`Контекст/Характер персонажа: ${context.personality.slice(0, 300)}`);
-  }
-  if (context?.scenario) {
-    userPromptParts.push(`Сценарий/Обстановка: ${context.scenario.slice(0, 300)}`);
-  }
-  if (fieldLabel) {
-    userPromptParts.push(`Поле карточки для перевода: ${fieldLabel}`);
-  }
-  userPromptParts.push(`Исходный текст:\n\n${text}`);
-
-  const userContent = userPromptParts.join('\n\n');
-
-  const requestBody = {
-    model: settings.model || 'deepseek/deepseek-chat',
-    messages: [
-      { role: 'system', content: settings.systemPrompt || DEFAULT_PROMPT_RU },
-      { role: 'user', content: userContent }
-    ],
-    temperature: parseFloat(settings.temperature) || 0.3,
-    max_tokens: parseInt(settings.maxTokens, 10) || 8192,
-    stream: false
-  };
-
-  try {
-    let translated = await postChatCompletion({
-      rawEndpoint,
-      requestBody,
-      headers,
-      provider: settings.provider,
-      signal
-    });
-
-    if (typeof translated === 'string') {
-      if (fieldLabel !== 'Имя персонажа' && fieldLabel !== 'name') {
-        translated = repairMacrosAndTags(balanceAsterisks(translated));
-      }
-    }
-
-    return translated;
-  } catch (err) {
-    if (err.name === 'AbortError') {
-      throw new Error('Перевод был отменен пользователем.');
-    }
-    let msg = err.message;
-    if (msg.includes('Failed to fetch') || msg.includes('NetworkError') || err.name === 'TypeError') {
-      msg = 'Сетевая ошибка при запросе к LLM. Убедитесь, что сервер запущен через start.bat или run.py.';
-    }
-    throw new Error(msg);
-  }
 }

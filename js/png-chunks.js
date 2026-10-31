@@ -157,45 +157,55 @@ export function extractCardFromPNG(uint8Array) {
 }
 
 /**
- * Embeds character card JSON into a PNG image as a tEXt chunk 'chara'
- * Removes any pre-existing 'chara' or 'ccv3' chunks to keep the file clean.
+ * Builds a complete tEXt chunk (Length + Type + keyword\0base64(json) + CRC)
  */
-export function embedCardInPNG(imageUint8Array, cardJsonObject) {
-  if (!isPNG(imageUint8Array)) {
-    throw new Error('Исходное изображение должно быть формата PNG');
-  }
-
+function buildCardTextChunk(keywordStr, cardJsonObject) {
   const jsonStr = typeof cardJsonObject === 'string' ? cardJsonObject : JSON.stringify(cardJsonObject);
-  const base64Data = utf8ToBase64(jsonStr);
-
-  // Keyword: 'chara\0'
-  const keyword = [0x63, 0x68, 0x61, 0x72, 0x61, 0x00];
-  const base64Bytes = new Uint8Array(base64Data.length);
-  for (let i = 0; i < base64Data.length; i++) {
-    base64Bytes[i] = base64Data.charCodeAt(i);
+  const payloadStr = `${keywordStr}\0${utf8ToBase64(jsonStr)}`;
+  const payload = new Uint8Array(payloadStr.length);
+  for (let i = 0; i < payloadStr.length; i++) {
+    payload[i] = payloadStr.charCodeAt(i);
   }
-
-  const chunkPayloadLen = keyword.length + base64Bytes.length;
-  const newChunkData = new Uint8Array(chunkPayloadLen);
-  newChunkData.set(keyword, 0);
-  newChunkData.set(base64Bytes, keyword.length);
 
   // Chunk type 'tEXt' = [0x74, 0x45, 0x58, 0x74]
   const typeBytes = new Uint8Array([0x74, 0x45, 0x58, 0x74]);
 
   // Compute CRC32 over (type + payload)
-  const crcBuffer = new Uint8Array(4 + chunkPayloadLen);
+  const crcBuffer = new Uint8Array(4 + payload.length);
   crcBuffer.set(typeBytes, 0);
-  crcBuffer.set(newChunkData, 4);
+  crcBuffer.set(payload, 4);
   const crc32 = calculateCRC32(crcBuffer, 0, crcBuffer.length);
 
-  // Build complete tEXt chunk: Length (4) + Type (4) + Data (N) + CRC (4)
-  const newChunk = new Uint8Array(12 + chunkPayloadLen);
-  const newChunkView = new DataView(newChunk.buffer);
-  newChunkView.setUint32(0, chunkPayloadLen, false);
-  newChunk.set(typeBytes, 4);
-  newChunk.set(newChunkData, 8);
-  newChunkView.setUint32(8 + chunkPayloadLen, crc32, false);
+  const chunk = new Uint8Array(12 + payload.length);
+  const view = new DataView(chunk.buffer);
+  view.setUint32(0, payload.length, false);
+  chunk.set(typeBytes, 4);
+  chunk.set(payload, 8);
+  view.setUint32(8 + payload.length, crc32, false);
+  return chunk;
+}
+
+/**
+ * Embeds character card JSON into a PNG image.
+ * `cards` is either a single card object (written as 'chara') or { chara, ccv3 }.
+ * Removes any pre-existing 'chara' or 'ccv3' chunks to keep the file clean.
+ */
+export function embedCardInPNG(imageUint8Array, cards) {
+  if (!isPNG(imageUint8Array)) {
+    throw new Error('Исходное изображение должно быть формата PNG');
+  }
+
+  const isMulti = cards && typeof cards === 'object' && ('chara' in cards || 'ccv3' in cards) && !('spec' in cards);
+  const chunks = isMulti
+    ? Object.entries(cards).filter(([, v]) => v).map(([kw, v]) => buildCardTextChunk(kw, v))
+    : [buildCardTextChunk('chara', cards)];
+
+  const newChunk = new Uint8Array(chunks.reduce((sum, c) => sum + c.length, 0));
+  let chunkOffset = 0;
+  for (const c of chunks) {
+    newChunk.set(c, chunkOffset);
+    chunkOffset += c.length;
+  }
 
   // Read existing chunks and remove any old chara/ccv3 tEXt chunks
   const view = new DataView(imageUint8Array.buffer, imageUint8Array.byteOffset, imageUint8Array.byteLength);
@@ -214,6 +224,7 @@ export function embedCardInPNG(imageUint8Array, cardJsonObject) {
     );
 
     const chunkTotalLen = 12 + length;
+    if (offset + chunkTotalLen > imageUint8Array.length) break; // truncated file: drop the broken tail
     const chunkBytes = imageUint8Array.subarray(offset, offset + chunkTotalLen);
 
     let isOldChara = false;
